@@ -1,0 +1,31 @@
+# Dependencies & Build Outputs
+node_modules/
+build/
+dist/
+coverage/
+
+# Environment & Secrets (NEVER commit real secrets)
+.env*
+!.env.example
+!.env.production.example
+
+# Runtime Local Database (NEVER commit user/transaction data)
+data/*.json
+data/*.tmp*
+!data/db.example.json
+
+# Logs, Temp, Binaries & Editor Artifacts
+*.log
+*.pid
+*.exe
+.DS_Store
+Thumbs.db
+.aistudio/
+.vscode/
+.idea/
+deploy/logs/
+deploy/bin/
+deploy/nginx/bin/
+deploy/nginx/conf/
+deploy/nginx/logs/
+deploy/nginx/temp/

@@ -1,0 +1,32 @@
+[Unit]
+Description=AI ECG Analyzer Web Application Service
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/ecg-ai
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOST=127.0.0.1
+EnvironmentFile=-/var/www/ecg-ai/.env
+ExecStart=/usr/bin/npm start
+Restart=always
+RestartSec=5s
+
+# Process security and privilege restrictions
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictRealtime=true
+ReadWritePaths=/var/www/ecg-ai/data
+
+# Resource limits
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
