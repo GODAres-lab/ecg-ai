@@ -16,42 +16,188 @@ export interface ProcessedEcgImage {
   orientationDescription: string;
 }
 
+const MAX_OPTIMAL_DIMENSION_PX = 2560;
+
 /**
- * Reads an uploaded or captured ECG image file, automatically detects EXIF orientation
- * and dimensions, and prepares the unmodified original image payload for direct
- * AI multimodal analysis without requiring any user preprocessing.
+ * Reads an uploaded or captured ECG image file, automatically detects EXIF orientation,
+ * normalizes rotated smartphone photos upright onto a high-definition canvas when needed
+ * (so the Vision encoder never receives sideways/upside-down 1mm ECG grids), and caps
+ * oversized >2560px camera images cleanly without losing millimeter grid sharpness.
  */
 export async function processEcgImageFile(file: File): Promise<ProcessedEcgImage> {
-  const mimeType = file.type || inferMimeTypeFromFilename(file.name);
-  const validation = validateImageInput(mimeType, file.size);
+  const rawMime = file.type || inferMimeTypeFromFilename(file.name);
+  const validation = validateImageInput(rawMime, file.size);
   if (!validation.valid) {
     throw new Error(validation.error);
   }
 
+  const normalizedMime = rawMime === 'image/jpg' ? 'image/jpeg' : rawMime;
   const arrayBuffer = await file.arrayBuffer();
   const exifOrientation = detectExifOrientationFromBuffer(arrayBuffer);
-  const orientationDescription = describeExifOrientation(exifOrientation);
+  const baseOrientationDesc = describeExifOrientation(exifOrientation);
 
-  const dataUrl = await readFileAsDataUrl(file);
-  const commaIdx = dataUrl.indexOf(',');
-  if (commaIdx === -1) {
-    throw new Error('Could not encode ECG image data.');
+  const originalDataUrl = await readFileAsDataUrl(file);
+  const loadedImg = await loadImageElement(originalDataUrl);
+  const naturalW = loadedImg.naturalWidth || 1200;
+  const naturalH = loadedImg.naturalHeight || 800;
+
+  const needsExifBake = exifOrientation > 1;
+  const longestEdge = Math.max(naturalW, naturalH);
+  const needsDownscale = longestEdge > MAX_OPTIMAL_DIMENSION_PX;
+
+  // Preserve exact original bytes when already upright (EXIF 1) and within optimal HD bounds
+  if (!needsExifBake && !needsDownscale) {
+    const commaIdx = originalDataUrl.indexOf(',');
+    if (commaIdx === -1) {
+      throw new Error('Could not encode ECG image data.');
+    }
+    return {
+      file,
+      previewDataUrl: originalDataUrl,
+      base64Data: originalDataUrl.slice(commaIdx + 1),
+      mimeType: normalizedMime,
+      width: naturalW,
+      height: naturalH,
+      sizeBytes: file.size,
+      exifOrientation: 1,
+      orientationDescription: baseOrientationDesc,
+    };
   }
-  const base64Data = dataUrl.slice(commaIdx + 1);
 
-  const dimensions = await getImageDimensions(dataUrl);
+  // Browser <img> already decodes EXIF orientation upright via default CSS image-orientation: from-image.
+  // Rendering to a high-precision canvas bakes upright pixels (0°) at optimal HD resolution.
+  const scale = needsDownscale ? MAX_OPTIMAL_DIMENSION_PX / longestEdge : 1;
+  const targetW = Math.max(1, Math.round(naturalW * scale));
+  const targetH = Math.max(1, Math.round(naturalH * scale));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = targetW;
+  canvas.height = targetH;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    const commaIdx = originalDataUrl.indexOf(',');
+    return {
+      file,
+      previewDataUrl: originalDataUrl,
+      base64Data: commaIdx !== -1 ? originalDataUrl.slice(commaIdx + 1) : '',
+      mimeType: normalizedMime,
+      width: naturalW,
+      height: naturalH,
+      sizeBytes: file.size,
+      exifOrientation,
+      orientationDescription: baseOrientationDesc,
+    };
+  }
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(0, 0, targetW, targetH);
+  ctx.drawImage(loadedImg, 0, 0, targetW, targetH);
+
+  const outMime = normalizedMime === 'image/png' && !needsDownscale ? 'image/png' : 'image/jpeg';
+  const normalizedDataUrl =
+    outMime === 'image/png'
+      ? canvas.toDataURL('image/png')
+      : canvas.toDataURL('image/jpeg', 0.94);
+
+  const commaIdx = normalizedDataUrl.indexOf(',');
+  const base64Data = commaIdx !== -1 ? normalizedDataUrl.slice(commaIdx + 1) : '';
+  const approxBytes = Math.floor((base64Data.length * 3) / 4);
+
+  const noteParts: string[] = [];
+  if (needsExifBake) {
+    noteParts.push(`Upright-normalized from EXIF #${exifOrientation}`);
+  } else {
+    noteParts.push('Standard upright orientation');
+  }
+  if (needsDownscale) {
+    noteParts.push(`HD-calibrated ${targetW}x${targetH}px`);
+  }
 
   return {
     file,
-    previewDataUrl: dataUrl,
+    previewDataUrl: normalizedDataUrl,
     base64Data,
-    mimeType: mimeType === 'image/jpg' ? 'image/jpeg' : mimeType,
-    width: dimensions.width,
-    height: dimensions.height,
-    sizeBytes: file.size,
-    exifOrientation,
-    orientationDescription,
+    mimeType: outMime,
+    width: targetW,
+    height: targetH,
+    sizeBytes: approxBytes || file.size,
+    exifOrientation: 1,
+    orientationDescription: noteParts.join(' · '),
   };
+}
+
+/**
+ * Physically rotates the active ProcessedEcgImage by 90° clockwise on a high-precision canvas
+ * so both the on-screen preview and the base64 image transmitted to Gemini AI match 100%.
+ */
+export async function rotateProcessedEcgImage90(
+  current: ProcessedEcgImage
+): Promise<ProcessedEcgImage> {
+  const img = await loadImageElement(current.previewDataUrl);
+  const srcW = img.naturalWidth || current.width;
+  const srcH = img.naturalHeight || current.height;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = srcH;
+  canvas.height = srcW;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    return current;
+  }
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.save();
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate(Math.PI / 2);
+  ctx.drawImage(img, -srcW / 2, -srcH / 2, srcW, srcH);
+  ctx.restore();
+
+  const outMime = current.mimeType === 'image/png' ? 'image/png' : 'image/jpeg';
+  const rotatedDataUrl =
+    outMime === 'image/png'
+      ? canvas.toDataURL('image/png')
+      : canvas.toDataURL('image/jpeg', 0.94);
+
+  const commaIdx = rotatedDataUrl.indexOf(',');
+  const base64Data = commaIdx !== -1 ? rotatedDataUrl.slice(commaIdx + 1) : current.base64Data;
+  const approxBytes = Math.floor((base64Data.length * 3) / 4);
+
+  const rotatedBlob = await dataUrlToBlob(rotatedDataUrl, outMime);
+  const rotatedFile = new File([rotatedBlob], current.file.name, { type: outMime });
+
+  return {
+    file: rotatedFile,
+    previewDataUrl: rotatedDataUrl,
+    base64Data,
+    mimeType: outMime,
+    width: canvas.width,
+    height: canvas.height,
+    sizeBytes: approxBytes,
+    exifOrientation: 1,
+    orientationDescription: 'Manually rotated +90° upright by clinician',
+  };
+}
+
+async function dataUrlToBlob(dataUrl: string, fallbackMime: string): Promise<Blob> {
+  try {
+    const res = await fetch(dataUrl);
+    return await res.blob();
+  } catch {
+    const commaIdx = dataUrl.indexOf(',');
+    const b64 = commaIdx !== -1 ? dataUrl.slice(commaIdx + 1) : '';
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    return new Blob([bytes], { type: fallbackMime });
+  }
 }
 
 function inferMimeTypeFromFilename(name: string): string {
@@ -77,18 +223,11 @@ function readFileAsDataUrl(file: File): Promise<string> {
   });
 }
 
-function getImageDimensions(dataUrl: string): Promise<{ width: number; height: number }> {
-  return new Promise((resolve) => {
+function loadImageElement(dataUrl: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
     const img = new Image();
-    img.onload = () => {
-      resolve({
-        width: img.naturalWidth || 1200,
-        height: img.naturalHeight || 800,
-      });
-    };
-    img.onerror = () => {
-      resolve({ width: 0, height: 0 });
-    };
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('Unable to decode ECG image dimensions.'));
     img.src = dataUrl;
   });
 }

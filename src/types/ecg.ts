@@ -160,6 +160,16 @@ export interface ConsentRecord {
 
 export type UiLanguage = 'id' | 'en';
 
+export type AnalysisMode = 'verified' | 'standard';
+
+export interface VerificationMetadata {
+  mode: AnalysisMode;
+  dualPassCompleted: boolean;
+  cachedDeterministic: boolean;
+  mathChecksApplied: string[];
+  inputFingerprint?: string;
+}
+
 export interface ClinicalContextInput {
   patientAgeSex?: string;
   symptoms?: string;
@@ -173,6 +183,7 @@ export interface AnalysisHistoryItem {
   modelUsed: string;
   reportLanguage?: UiLanguage;
   clinicalContext?: ClinicalContextInput;
+  verification?: VerificationMetadata;
   thumbnailDataUrl?: string;
   report: EcgAnalysisReport;
 }

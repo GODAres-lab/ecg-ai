@@ -13,12 +13,15 @@ import {
   Maximize2,
   Calculator,
   Stethoscope,
+  ShieldCheck,
+  RefreshCw,
 } from 'lucide-react';
 import type {
   ClinicalContextInput,
   EcgAnalysisReport,
   MeasuredValue,
   UiLanguage,
+  VerificationMetadata,
 } from '../types/ecg';
 import type { ProcessedEcgImage } from '../utils/imageProcessor';
 import {
@@ -35,9 +38,11 @@ interface EcgReportViewProps {
   image: ProcessedEcgImage | null;
   fallbackImageUrl?: string;
   clinicalContext?: ClinicalContextInput;
+  verification?: VerificationMetadata;
   modelUsed: string;
   analyzedAt: string;
   onAnalyzeAnother: () => void;
+  onReverifyFresh?: () => void;
   onOpenCalculator: () => void;
   onNotify?: (type: 'success' | 'info' | 'error', message: string) => void;
   uiLang?: UiLanguage;
@@ -81,9 +86,11 @@ export const EcgReportView: React.FC<EcgReportViewProps> = ({
   image,
   fallbackImageUrl,
   clinicalContext,
+  verification,
   modelUsed,
   analyzedAt,
   onAnalyzeAnother,
+  onReverifyFresh,
   onOpenCalculator,
   onNotify,
   uiLang = 'id',
@@ -304,6 +311,34 @@ export const EcgReportView: React.FC<EcgReportViewProps> = ({
               {uiLang === 'id' ? 'KETERBACAAN:' : 'READABILITY:'}{' '}
               <strong>{report.image_quality.overall_readability.toUpperCase()}</strong>
             </span>
+            {verification && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded font-semibold border ${
+                    verification.dualPassCompleted
+                      ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                      : 'bg-blue-50 text-blue-800 border-blue-200'
+                  }`}
+                >
+                  <ShieldCheck className="w-3 h-3 shrink-0" />
+                  <span>
+                    {verification.dualPassCompleted
+                      ? uiLang === 'id'
+                        ? 'AUDIT KLINIS 2-TAHAP'
+                        : '2-PASS CLINICAL AUDIT'
+                      : uiLang === 'id'
+                        ? 'DETERMINISTIK + VALIDASI MATEMATIS'
+                        : 'DETERMINISTIC + MATH VERIFIED'}
+                  </span>
+                </span>
+                {verification.cachedDeterministic && (
+                  <span className="px-2 py-0.5 bg-indigo-50 text-indigo-800 border border-indigo-200 rounded font-semibold">
+                    {uiLang === 'id' ? 'KONSISTENSI SHA-256' : 'SHA-256 REPRODUCIBLE'}
+                  </span>
+                )}
+              </>
+            )}
           </div>
           <h1 className="text-xl sm:text-2xl font-extrabold text-slate-900">
             {uiLang === 'id'
@@ -313,6 +348,22 @@ export const EcgReportView: React.FC<EcgReportViewProps> = ({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          {image && onReverifyFresh && (
+            <button
+              type="button"
+              onClick={onReverifyFresh}
+              title={
+                uiLang === 'id'
+                  ? 'Jalankan ulang verifikasi AI dari awal (tanpa cache) untuk menguji konsistensi'
+                  : 'Re-run fresh uncached AI audit pass to verify consistency'
+              }
+              className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-xl hover:bg-emerald-100 transition-colors cursor-pointer"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>{uiLang === 'id' ? 'Audit Ulang' : 'Fresh Audit'}</span>
+            </button>
+          )}
+
           {displayImageUrl && (
             <label className="flex items-center gap-2 text-xs text-slate-700 mr-1.5 cursor-pointer select-none">
               <input
@@ -381,6 +432,26 @@ export const EcgReportView: React.FC<EcgReportViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Deterministic Clinical & Mathematical Verification Summary Strip */}
+      {verification && verification.mathChecksApplied.length > 0 && (
+        <div className="no-print px-4 py-2.5 bg-emerald-50/70 border border-emerald-200/90 rounded-2xl flex flex-wrap items-center gap-2 text-xs text-emerald-950">
+          <span className="inline-flex items-center gap-1.5 font-bold text-emerald-900">
+            <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+            {uiLang === 'id'
+              ? 'Pemeriksaan Silang Deterministik & Matematis:'
+              : 'Deterministic & Mathematical Cross-Checks:'}
+          </span>
+          {verification.mathChecksApplied.map((chk) => (
+            <span
+              key={chk}
+              className="px-2 py-0.5 rounded-md bg-white/90 border border-emerald-200 font-mono text-[11px] text-emerald-900"
+            >
+              ✓ {chk}
+            </span>
+          ))}
+        </div>
+      )}
 
       {/* Optional Clinical Context Callout (if provided during analysis) */}
       {clinicalContext &&

@@ -83,6 +83,87 @@ function safeMeasurementSource(value: unknown): MeasurementSource {
   return 'Unmeasurable';
 }
 
+function isUnmeasurableToken(val: string): boolean {
+  const lower = val.trim().toLowerCase();
+  return (
+    lower.length === 0 ||
+    lower === '-' ||
+    lower === '--' ||
+    lower === '---' ||
+    lower === 'n/a' ||
+    lower === 'na' ||
+    lower === 'none' ||
+    lower === 'unknown' ||
+    lower.includes('not measurable') ||
+    lower.includes('unmeasurable') ||
+    lower.includes('indeterminate') ||
+    lower.includes('tidak terukur') ||
+    lower.includes('tidak dapat diukur')
+  );
+}
+
+/**
+ * Canonicalizes numeric strings so Unicode minus signs (−, –), leading "~"/"approx",
+ * and duplicated trailing unit tokens ("74 bpm", "+54°") are standardized consistently.
+ */
+function canonicalizeNumericValueString(rawVal: string, defaultUnit: string): string {
+  if (isUnmeasurableToken(rawVal)) {
+    return 'Not measurable';
+  }
+
+  // Replace Unicode minus/en-dash/em-dash with standard ASCII hyphen-minus
+  let cleaned = rawVal
+    .replace(/[\u2212\u2013\u2014]/g, '-')
+    .replace(/^(approx\.?|approximately|sekitar|~|≈)\s*/i, '')
+    .trim();
+
+  // Strip trailing unit if it matches simple single signed number + unit
+  const singleNumWithUnit = cleaned.match(/^([+-]?\d+(?:\.\d+)?)\s*(bpm|ms|deg|degrees|°)?$/i);
+  if (singleNumWithUnit) {
+    const num = parseFloat(singleNumWithUnit[1]);
+    if (!Number.isNaN(num)) {
+      if (defaultUnit === '°') {
+        // Normalize 181..360° into Cabrera -179..0° convention
+        const cabrera = num > 180 && num <= 360 ? num - 360 : num;
+        const rounded = Math.round(cabrera);
+        if (rounded > 0) return `+${rounded}`;
+        return `${rounded}`;
+      }
+      return Number.isInteger(num) ? `${num}` : `${Math.round(num * 10) / 10}`;
+    }
+  }
+
+  return cleaned;
+}
+
+/**
+ * Extracts a single representative numeric value from a MeasuredValue string.
+ * Returns null for ranges with wide spread or unmeasurable strings.
+ */
+export function parseMeasuredNumber(val: string): number | null {
+  if (!val || isUnmeasurableToken(val)) return null;
+  const normalized = val.replace(/[\u2212\u2013\u2014]/g, '-').trim();
+
+  // Direct single number
+  const single = normalized.match(/^([+-]?\d+(?:\.\d+)?)\s*(?:bpm|ms|°|deg|degrees)?$/i);
+  if (single) {
+    const parsed = parseFloat(single[1]);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+
+  // Narrow positive range like "72-76" -> midpoint 74 (only when first token is positive and second > first)
+  const range = normalized.match(/^(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*(?:bpm|ms)?$/i);
+  if (range) {
+    const a = parseFloat(range[1]);
+    const b = parseFloat(range[2]);
+    if (!Number.isNaN(a) && !Number.isNaN(b) && b >= a && b - a <= 25) {
+      return Math.round((a + b) / 2);
+    }
+  }
+
+  return null;
+}
+
 function normalizeMeasuredValue(raw: unknown, defaultUnit: string, defaultRange: string): MeasuredValue {
   if (!raw || typeof raw !== 'object') {
     return {
@@ -95,18 +176,14 @@ function normalizeMeasuredValue(raw: unknown, defaultUnit: string, defaultRange:
     };
   }
   const obj = raw as Record<string, unknown>;
-  const val = safeText(obj.value, 'Not measurable');
-  const isUnmeasurable =
-    val.toLowerCase().includes('not measurable') ||
-    val.toLowerCase().includes('unmeasurable') ||
-    val.toLowerCase().includes('indeterminate') ||
-    val.toLowerCase() === 'n/a' ||
-    val.toLowerCase() === 'unknown';
+  const rawVal = safeText(obj.value, 'Not measurable');
+  const val = canonicalizeNumericValueString(rawVal, defaultUnit);
+  const unmeasurable = isUnmeasurableToken(val);
 
   return {
-    value: val,
-    unit: typeof obj.unit === 'string' ? obj.unit : defaultUnit,
-    source: isUnmeasurable ? 'Unmeasurable' : safeMeasurementSource(obj.source),
+    value: unmeasurable ? 'Not measurable' : val,
+    unit: typeof obj.unit === 'string' && obj.unit.trim().length > 0 ? obj.unit.trim() : defaultUnit,
+    source: unmeasurable ? 'Unmeasurable' : safeMeasurementSource(obj.source),
     normalRange: safeText(obj.normalRange, defaultRange),
     assessment: safeText(
       obj.assessment,
@@ -149,11 +226,100 @@ function normalizeStringArray(raw: unknown, fallbackItem?: string): string[] {
   return fallbackItem ? [fallbackItem] : [];
 }
 
-export function validateAndNormalizeEcgResponse(rawPayload: unknown): EcgAnalysisReport {
+/**
+ * Assigns canonical clinical 12-lead rank so `lead_analysis` order never fluctuates
+ * between row-major (I, aVR, V1, V4...) and standard sequence (I, II, III, aVR, aVL, aVF, V1–V6).
+ */
+function getCanonicalLeadRank(leadName: string): number {
+  const cleaned = leadName
+    .trim()
+    .replace(/^sadapan\s+/i, '')
+    .replace(/^lead\s+/i, '')
+    .trim();
+  const upper = cleaned.toUpperCase();
+
+  if (upper.includes('RHYTHM') || upper.includes('IRAMA') || upper.includes('STRIP')) {
+    return 30;
+  }
+
+  const exactOrder: Record<string, number> = {
+    I: 1,
+    II: 2,
+    III: 3,
+    AVR: 4,
+    '-AVR': 4,
+    AVL: 5,
+    AVF: 6,
+    V1: 7,
+    V2: 8,
+    V3: 9,
+    V4: 10,
+    V5: 11,
+    V6: 12,
+    V3R: 20,
+    V4R: 21,
+    V7: 22,
+    V8: 23,
+    V9: 24,
+  };
+
+  if (exactOrder[upper] !== undefined) {
+    return exactOrder[upper];
+  }
+
+  // Prefix match like "II (Limb)" or "V1 (Precordial)"
+  const token = upper.split(/[\s(/:,-]+/)[0];
+  if (token && exactOrder[token] !== undefined) {
+    return exactOrder[token];
+  }
+
+  return 99;
+}
+
+function claimsNormalOnly(assessmentText: string): boolean {
+  const lower = assessmentText.toLowerCase();
+  const hasNormalPhrase =
+    lower.includes('within normal') ||
+    lower.includes('normal limit') ||
+    lower.includes('normal range') ||
+    lower.includes('normal axis') ||
+    lower.includes('batas normal') ||
+    lower.includes('aksis normal') ||
+    lower === 'normal';
+  const hasAbnormalQualifier =
+    lower.includes('prolong') ||
+    lower.includes('memanjang') ||
+    lower.includes('short') ||
+    lower.includes('pendek') ||
+    lower.includes('wide') ||
+    lower.includes('lebar') ||
+    lower.includes('brady') ||
+    lower.includes('bradi') ||
+    lower.includes('tachy') ||
+    lower.includes('taki') ||
+    lower.includes('deviation') ||
+    lower.includes('deviasi') ||
+    lower.includes('abnormal') ||
+    lower.includes('borderline');
+  return hasNormalPhrase && !hasAbnormalQualifier;
+}
+
+export interface CrossCheckedEcgResult {
+  report: EcgAnalysisReport;
+  mathChecksApplied: string[];
+}
+
+/**
+ * Validates, normalizes, and runs deterministic physiological & mathematical cross-checks
+ * (Bazett/Fridericia QTc math verification, Cabrera QRS axis quadrant verification,
+ * interval threshold guards, canonical 12-lead ordering, and urgency safety harmonization).
+ */
+export function validateAndCrossCheckEcgResponse(rawPayload: unknown): CrossCheckedEcgResult {
   if (!rawPayload || typeof rawPayload !== 'object') {
     throw new Error('AI response is empty or not a valid JSON object.');
   }
 
+  const mathChecksApplied: string[] = [];
   const data = rawPayload as Record<string, unknown>;
   const rec = (data.recording_information as Record<string, unknown>) || {};
   const qual = (data.image_quality as Record<string, unknown>) || {};
@@ -180,34 +346,42 @@ export function validateAndNormalizeEcgResponse(rawPayload: unknown): EcgAnalysi
       ? qual.can_interpret_reliably && readability !== 'Unreadable'
       : readability === 'High' || readability === 'Moderate';
 
-  const urgencyLevel = normalizeUrgencyCategory(data.urgency_level, canInterpretReliably);
+  let urgencyLevel = normalizeUrgencyCategory(data.urgency_level, canInterpretReliably);
 
+  // Normalize & canonically sort 12-lead analysis items
   const rawLeads = Array.isArray(data.lead_analysis) ? data.lead_analysis : [];
   const leadAnalysis: LeadAnalysisItem[] =
     rawLeads.length > 0
-      ? rawLeads.map((item: unknown, idx: number) => {
-          const l = (item as Record<string, unknown>) || {};
-          return {
-            leadName: safeText(l.leadName, `Unidentified Lead #${idx + 1}`),
-            identifiedFromLabel: typeof l.identifiedFromLabel === 'boolean' ? l.identifiedFromLabel : false,
-            rhythmAndWaveform: safeText(
-              l.rhythmAndWaveform,
-              'Waveform not reliably assessable on this lead'
-            ),
-            pWave: safeText(l.pWave, 'Not reliably identifiable'),
-            qrsMorphology: safeText(l.qrsMorphology, 'Not reliably identifiable'),
-            stSegment: safeText(l.stSegment, 'Indeterminate baseline / ST segment'),
-            tWave: safeText(l.tWave, 'Not reliably identifiable'),
-            abnormalities: safeText(
-              l.abnormalities,
-              'Indeterminate due to lead visibility or not separately distinguished'
-            ),
-            confidenceAndLimitations: safeText(
-              l.confidenceAndLimitations,
-              'Limited by optical resolution and paper grid legibility'
-            ),
-          };
-        })
+      ? rawLeads
+          .map((item: unknown, idx: number) => {
+            const l = (item as Record<string, unknown>) || {};
+            return {
+              _origIdx: idx,
+              leadName: safeText(l.leadName, `Unidentified Lead #${idx + 1}`),
+              identifiedFromLabel: typeof l.identifiedFromLabel === 'boolean' ? l.identifiedFromLabel : false,
+              rhythmAndWaveform: safeText(
+                l.rhythmAndWaveform,
+                'Waveform not reliably assessable on this lead'
+              ),
+              pWave: safeText(l.pWave, 'Not reliably identifiable'),
+              qrsMorphology: safeText(l.qrsMorphology, 'Not reliably identifiable'),
+              stSegment: safeText(l.stSegment, 'Indeterminate baseline / ST segment'),
+              tWave: safeText(l.tWave, 'Not reliably identifiable'),
+              abnormalities: safeText(
+                l.abnormalities,
+                'Indeterminate due to lead visibility or not separately distinguished'
+              ),
+              confidenceAndLimitations: safeText(
+                l.confidenceAndLimitations,
+                'Limited by optical resolution and paper grid legibility'
+              ),
+            };
+          })
+          .sort((a, b) => {
+            const rankDiff = getCanonicalLeadRank(a.leadName) - getCanonicalLeadRank(b.leadName);
+            return rankDiff !== 0 ? rankDiff : a._origIdx - b._origIdx;
+          })
+          .map(({ _origIdx: _, ...cleanLead }) => cleanLead)
       : [
           {
             leadName: 'Lead Identification Incomplete',
@@ -221,6 +395,189 @@ export function validateAndNormalizeEcgResponse(rawPayload: unknown): EcgAnalysi
             confidenceAndLimitations: 'Low confidence — clear lead labels were not legible.',
           },
         ];
+
+  if (rawLeads.length > 1) {
+    mathChecksApplied.push('Canonical 12-lead sequence ordering');
+  }
+
+  // Normalize vital numeric measurements
+  const ventRate = normalizeMeasuredValue(hr.ventricular_rate_bpm, 'bpm', '60–100 bpm');
+  const atrialRate = normalizeMeasuredValue(hr.atrial_rate_bpm, 'bpm', '60–100 bpm');
+  const prInterval = normalizeMeasuredValue(intv.pr_interval_ms, 'ms', '120–200 ms');
+  const qrsDuration = normalizeMeasuredValue(intv.qrs_duration_ms, 'ms', '< 120 ms');
+  const qtInterval = normalizeMeasuredValue(intv.qt_interval_ms, 'ms', '350–450 ms');
+  const qtcInterval = normalizeMeasuredValue(
+    intv.qtc_interval_ms,
+    'ms',
+    '< 450 ms (M) / < 460 ms (F)'
+  );
+  let qtcFormulaUsed = safeText(
+    intv.qtc_formula_used,
+    'Not calculated or printed directly on report'
+  );
+
+  const pAxis = normalizeMeasuredValue(axis.p_wave_axis, '°', '0° to +75°');
+  const qrsAxis = normalizeMeasuredValue(axis.qrs_axis, '°', '-30° to +90°');
+  const tAxis = normalizeMeasuredValue(axis.t_wave_axis, '°', 'Concordant with QRS');
+
+  // 1. Deterministic Heart Rate Threshold Check
+  const hrNum = parseMeasuredNumber(ventRate.value);
+  if (hrNum !== null && hrNum >= 20 && hrNum <= 300) {
+    if (hrNum < 60 && claimsNormalOnly(ventRate.assessment)) {
+      ventRate.assessment = `Bradycardia range (${hrNum} bpm < 60 bpm)`;
+      mathChecksApplied.push('HR < 60 bpm bradycardia threshold harmonized');
+    } else if (hrNum > 100 && claimsNormalOnly(ventRate.assessment)) {
+      ventRate.assessment = `Tachycardia range (${hrNum} bpm > 100 bpm)`;
+      mathChecksApplied.push('HR > 100 bpm tachycardia threshold harmonized');
+    }
+  }
+
+  // 2. Deterministic PR & QRS Threshold Check
+  const prNum = parseMeasuredNumber(prInterval.value);
+  if (prNum !== null && prNum >= 60 && prNum <= 600) {
+    if (prNum > 200 && claimsNormalOnly(prInterval.assessment)) {
+      prInterval.assessment = `Prolonged PR interval (${prNum} ms > 200 ms — 1st-degree AV delay range)`;
+      mathChecksApplied.push('PR > 200 ms threshold harmonized');
+    } else if (prNum < 120 && claimsNormalOnly(prInterval.assessment)) {
+      prInterval.assessment = `Short PR interval (${prNum} ms < 120 ms)`;
+      mathChecksApplied.push('PR < 120 ms threshold harmonized');
+    }
+  }
+
+  const qrsNum = parseMeasuredNumber(qrsDuration.value);
+  if (qrsNum !== null && qrsNum >= 40 && qrsNum <= 300) {
+    if (qrsNum >= 120 && claimsNormalOnly(qrsDuration.assessment)) {
+      qrsDuration.assessment = `Wide / Prolonged QRS complex (${qrsNum} ms ≥ 120 ms)`;
+      mathChecksApplied.push('QRS ≥ 120 ms threshold harmonized');
+    }
+  }
+
+  // 3. Deterministic Mathematical QTc Cross-Validation (Bazett & Fridericia)
+  const qtNum = parseMeasuredNumber(qtInterval.value);
+  if (hrNum !== null && hrNum >= 25 && hrNum <= 250 && qtNum !== null && qtNum >= 180 && qtNum <= 750) {
+    const rrSec = 60 / hrNum;
+    const exactBazett = Math.round(qtNum / Math.sqrt(rrSec));
+    const exactFridericia = Math.round(qtNum / Math.cbrt(rrSec));
+    const prefersFridericia = qtcFormulaUsed.toLowerCase().includes('fridericia');
+    const targetFormulaVal = prefersFridericia ? exactFridericia : exactBazett;
+    const targetFormulaLabel = prefersFridericia
+      ? 'Fridericia (QT / RR^(1/3))'
+      : 'Bazett (QT / √RR)';
+
+    const currentQtcNum = parseMeasuredNumber(qtcInterval.value);
+
+    if (qtcInterval.source === 'Unmeasurable' || currentQtcNum === null) {
+      // Auto-compute QTc deterministically when HR and QT are both measured
+      const autoUseFridericia = hrNum > 100 || hrNum < 50;
+      const computed = autoUseFridericia ? exactFridericia : exactBazett;
+      qtcInterval.value = `${computed}`;
+      qtcInterval.unit = 'ms';
+      qtcInterval.source = 'AI Calculated';
+      qtcFormulaUsed = autoUseFridericia
+        ? 'Fridericia (Deterministic Math Verified — preferred at HR <50 or >100 bpm)'
+        : 'Bazett (Deterministic Math Verified)';
+      qtcInterval.assessment =
+        computed >= 500
+          ? `Markedly prolonged QTc (${computed} ms ≥ 500 ms)`
+          : computed > 460
+            ? `Prolonged QTc (${computed} ms > 460 ms)`
+            : computed < 340
+              ? `Short QTc (${computed} ms < 340 ms)`
+              : `Within normal reference range (${computed} ms)`;
+      mathChecksApplied.push(`QTc computed deterministically (${computed} ms)`);
+    } else if (qtcInterval.source !== 'Printed on ECG') {
+      // Verify AI arithmetic; overwrite if LLM calculation drifted by > 8 ms
+      if (Math.abs(currentQtcNum - targetFormulaVal) > 8) {
+        qtcInterval.value = `${targetFormulaVal}`;
+        qtcInterval.source = 'AI Calculated';
+        qtcFormulaUsed = `${targetFormulaLabel} — Math Verified`;
+        if (targetFormulaVal >= 500) {
+          qtcInterval.assessment = `Markedly prolonged QTc (${targetFormulaVal} ms ≥ 500 ms)`;
+        } else if (targetFormulaVal > 460 && claimsNormalOnly(qtcInterval.assessment)) {
+          qtcInterval.assessment = `Prolonged QTc (${targetFormulaVal} ms > 460 ms)`;
+        } else if (targetFormulaVal <= 450 && targetFormulaVal >= 350 && !claimsNormalOnly(qtcInterval.assessment)) {
+          qtcInterval.assessment = `Within normal reference range (${targetFormulaVal} ms)`;
+        }
+        mathChecksApplied.push(
+          `QTc arithmetic auto-corrected (${currentQtcNum} -> ${targetFormulaVal} ms)`
+        );
+      } else {
+        mathChecksApplied.push(`QTc math verified (Bazett ${exactBazett} ms / Fridericia ${exactFridericia} ms)`);
+      }
+    } else {
+      mathChecksApplied.push(`Printed QTc cross-checked (Bazett ${exactBazett} ms / Fridericia ${exactFridericia} ms)`);
+    }
+
+    const refStamp = `[Math Cross-Check: Bazett=${exactBazett} ms, Fridericia=${exactFridericia} ms]`;
+    if (!qtcInterval.reliabilityNote.includes('Math Cross-Check')) {
+      qtcInterval.reliabilityNote = `${qtcInterval.reliabilityNote} ${refStamp}`.trim();
+    }
+  }
+
+  // 4. Deterministic Cabrera QRS Electrical Axis Quadrant Check
+  const qrsDeg = parseMeasuredNumber(qrsAxis.value);
+  if (qrsDeg !== null && qrsDeg >= -180 && qrsDeg <= 180) {
+    const lowerAssess = qrsAxis.assessment.toLowerCase();
+    if (qrsDeg >= -30 && qrsDeg <= 90) {
+      const wronglyCallsDeviation =
+        lowerAssess.includes('left axis deviation') ||
+        lowerAssess.includes('right axis deviation') ||
+        lowerAssess.includes('extreme') ||
+        lowerAssess.includes('deviasi aksis kiri') ||
+        lowerAssess.includes('deviasi aksis kanan') ||
+        lowerAssess.includes('deviasi ekstrem');
+      if (wronglyCallsDeviation) {
+        qrsAxis.assessment = `Normal QRS axis (${qrsAxis.value}° within -30° to +90°)`;
+        mathChecksApplied.push('QRS axis quadrant harmonized to Normal (-30° to +90°)');
+      }
+    } else if (qrsDeg < -30 && qrsDeg >= -90) {
+      if (claimsNormalOnly(qrsAxis.assessment) || lowerAssess.includes('right axis') || lowerAssess.includes('aksiskanan')) {
+        qrsAxis.assessment = `Left Axis Deviation / LAD (${qrsAxis.value}° between -30° and -90°)`;
+        mathChecksApplied.push('QRS axis quadrant harmonized to LAD (-30° to -90°)');
+      }
+    } else if (qrsDeg > 90 && qrsDeg <= 180) {
+      if (claimsNormalOnly(qrsAxis.assessment) || lowerAssess.includes('left axis')) {
+        qrsAxis.assessment = `Right Axis Deviation / RAD (${qrsAxis.value}° between +90° and +180°)`;
+        mathChecksApplied.push('QRS axis quadrant harmonized to RAD (+90° to +180°)');
+      }
+    } else if (qrsDeg < -90) {
+      if (claimsNormalOnly(qrsAxis.assessment)) {
+        qrsAxis.assessment = `Extreme / Northwest Axis Deviation (${qrsAxis.value}° between -90° and -180°)`;
+        mathChecksApplied.push('QRS axis quadrant harmonized to Extreme Axis');
+      }
+    }
+  }
+
+  // 5. Objective Numeric Abnormality vs "Normal ECG appearance" Safety Guard
+  const verifiedQtcNum = parseMeasuredNumber(qtcInterval.value);
+  if (canInterpretReliably && urgencyLevel === 'Normal ECG appearance') {
+    const hasSevereNumericFlag =
+      (verifiedQtcNum !== null && verifiedQtcNum >= 500) ||
+      (hrNum !== null && (hrNum >= 150 || hrNum < 40));
+    const hasModerateNumericFlag =
+      (qrsNum !== null && qrsNum >= 120) ||
+      (prNum !== null && prNum > 210) ||
+      (verifiedQtcNum !== null && verifiedQtcNum >= 480) ||
+      (hrNum !== null && (hrNum > 110 || hrNum < 48)) ||
+      (qrsDeg !== null && (qrsDeg < -30 || qrsDeg > 90));
+
+    if (hasSevereNumericFlag) {
+      urgencyLevel = 'Potentially urgent abnormality';
+      mathChecksApplied.push('Urgency upgraded from Normal due to marked numeric interval/rate abnormality');
+    } else if (hasModerateNumericFlag) {
+      urgencyLevel = 'Abnormal ECG';
+      mathChecksApplied.push('Urgency upgraded from Normal due to abnormal numeric interval/rate/axis');
+    }
+  }
+
+  let timeCriticalWarning = safeText(data.time_critical_warning, '');
+  if (
+    urgencyLevel === 'Critical pattern requiring immediate emergency evaluation' &&
+    timeCriticalWarning.length === 0
+  ) {
+    timeCriticalWarning =
+      'Critical ECG pattern identified. Immediate clinical correlation and emergency medical evaluation are required.';
+  }
 
   const rawAdditional = Array.isArray(data.additional_findings) ? data.additional_findings : [];
   const additionalFindings = rawAdditional.map((item: unknown) => {
@@ -245,7 +602,7 @@ export function validateAndNormalizeEcgResponse(rawPayload: unknown): EcgAnalysi
         ? 'Moderate'
         : 'Insufficient Image Quality';
 
-  return {
+  const report: EcgAnalysisReport = {
     recording_information: {
       patient_identifier: safeText(rec.patient_identifier, 'Not visible on ECG'),
       age_and_sex: safeText(rec.age_and_sex, 'Not visible on ECG'),
@@ -289,10 +646,10 @@ export function validateAndNormalizeEcgResponse(rawPayload: unknown): EcgAnalysi
       data.urgency_explanation,
       'Clinical urgency must be determined in conjunction with patient symptoms, history, and serial ECGs.'
     ),
-    time_critical_warning: safeText(data.time_critical_warning, ''),
+    time_critical_warning: timeCriticalWarning,
     heart_rate: {
-      ventricular_rate_bpm: normalizeMeasuredValue(hr.ventricular_rate_bpm, 'bpm', '60–100 bpm'),
-      atrial_rate_bpm: normalizeMeasuredValue(hr.atrial_rate_bpm, 'bpm', '60–100 bpm'),
+      ventricular_rate_bpm: ventRate,
+      atrial_rate_bpm: atrialRate,
       rate_regularity_note: safeText(
         hr.rate_regularity_note,
         'Rate assessment depends on visible R-R interval consistency and paper speed.'
@@ -332,23 +689,16 @@ export function validateAndNormalizeEcgResponse(rawPayload: unknown): EcgAnalysi
       ),
     },
     intervals: {
-      pr_interval_ms: normalizeMeasuredValue(intv.pr_interval_ms, 'ms', '120–200 ms'),
-      qrs_duration_ms: normalizeMeasuredValue(intv.qrs_duration_ms, 'ms', '< 120 ms'),
-      qt_interval_ms: normalizeMeasuredValue(intv.qt_interval_ms, 'ms', '350–450 ms'),
-      qtc_interval_ms: normalizeMeasuredValue(
-        intv.qtc_interval_ms,
-        'ms',
-        '< 450 ms (M) / < 460 ms (F)'
-      ),
-      qtc_formula_used: safeText(
-        intv.qtc_formula_used,
-        'Not calculated or printed directly on report'
-      ),
+      pr_interval_ms: prInterval,
+      qrs_duration_ms: qrsDuration,
+      qt_interval_ms: qtInterval,
+      qtc_interval_ms: qtcInterval,
+      qtc_formula_used: qtcFormulaUsed,
     },
     electrical_axis: {
-      p_wave_axis: normalizeMeasuredValue(axis.p_wave_axis, '°', '0° to +75°'),
-      qrs_axis: normalizeMeasuredValue(axis.qrs_axis, '°', '-30° to +90°'),
-      t_wave_axis: normalizeMeasuredValue(axis.t_wave_axis, '°', 'Concordant with QRS'),
+      p_wave_axis: pAxis,
+      qrs_axis: qrsAxis,
+      t_wave_axis: tAxis,
       axis_deviation_summary: safeText(
         axis.axis_deviation_summary,
         'Electrical axis evaluation depends on limb lead I, II, III, and aVF clarity.'
@@ -464,6 +814,12 @@ export function validateAndNormalizeEcgResponse(rawPayload: unknown): EcgAnalysi
       ),
     },
   };
+
+  return { report, mathChecksApplied };
+}
+
+export function validateAndNormalizeEcgResponse(rawPayload: unknown): EcgAnalysisReport {
+  return validateAndCrossCheckEcgResponse(rawPayload).report;
 }
 
 export interface UrgencyVisualDescriptor {
@@ -562,17 +918,17 @@ export function describeExifOrientation(orientation: number): string {
     case 2:
       return 'Mirrored horizontal (auto-normalized)';
     case 3:
-      return 'Rotated 180° upside-down (auto-detected)';
+      return 'Rotated 180° upside-down (auto-normalized upright)';
     case 4:
       return 'Mirrored vertical (auto-normalized)';
     case 5:
-      return 'Mirrored horizontal & rotated 270° CW (auto-detected)';
+      return 'Mirrored horizontal & rotated 270° CW (auto-normalized upright)';
     case 6:
-      return 'Rotated 90° CW portrait/landscape (auto-detected)';
+      return 'Rotated 90° CW portrait/landscape (auto-normalized upright)';
     case 7:
-      return 'Mirrored horizontal & rotated 90° CW (auto-detected)';
+      return 'Mirrored horizontal & rotated 90° CW (auto-normalized upright)';
     case 8:
-      return 'Rotated 270° CW (auto-detected)';
+      return 'Rotated 270° CW (auto-normalized upright)';
     case 1:
     default:
       return 'Standard orientation (auto-verified)';

@@ -58,6 +58,7 @@ export interface AnalysisHistoryRecord {
     symptoms?: string;
     clinicalHistory?: string;
   };
+  verification?: any;
   report: any;
 }
 

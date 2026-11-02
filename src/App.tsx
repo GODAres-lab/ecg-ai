@@ -6,15 +6,18 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import type {
   AnalysisHistoryItem,
+  AnalysisMode,
   ClinicalContextInput,
   ConsentRecord,
   EcgAnalysisReport,
   UiLanguage,
+  VerificationMetadata,
 } from './types/ecg';
 import type { User, QuotaInfo } from './types/auth';
 import {
   generateClinicalSampleEcgFile,
   processEcgImageFile,
+  rotateProcessedEcgImage90,
   type ProcessedEcgImage,
   type SampleEcgScenario,
 } from './utils/imageProcessor';
@@ -52,6 +55,7 @@ const CONSENT_STORAGE_KEY = 'ai_ecg_analyzer_educational_consent_v1';
 export default function App() {
   const [uiLang, setUiLang] = useState<UiLanguage>(() => getSavedUiLanguage());
   const [reportLanguage, setReportLanguage] = useState<UiLanguage>(() => getSavedUiLanguage());
+  const [analysisMode, setAnalysisMode] = useState<AnalysisMode>('verified');
 
   const [consentRecord, setConsentRecord] = useState<ConsentRecord | null>(() => {
     try {
@@ -100,6 +104,9 @@ export default function App() {
   const [activeHistoryThumbnail, setActiveHistoryThumbnail] = useState<string | undefined>(
     undefined
   );
+  const [activeVerification, setActiveVerification] = useState<
+    VerificationMetadata | undefined
+  >(undefined);
   const [modelUsed, setModelUsed] = useState<string>('AI Multimodal Vision');
   const [analyzedAt, setAnalyzedAt] = useState<string>('');
 
@@ -262,7 +269,12 @@ export default function App() {
     }
   };
 
-  const executeAnalysis = async (imageToAnalyze: ProcessedEcgImage) => {
+  const executeAnalysis = async (
+    imageToAnalyze: ProcessedEcgImage,
+    runOptions?: { bypassCache?: boolean; forceMode?: AnalysisMode }
+  ) => {
+    const effectiveMode: AnalysisMode = runOptions?.forceMode || analysisMode;
+
     // Client-side quota guard
     if (quotaInfo && !quotaInfo.isSubscribed && quotaInfo.remainingQuota <= 0) {
       if (!currentUser) {
@@ -294,17 +306,28 @@ export default function App() {
     setErrorMessage(null);
     setAnalysisStageText(
       uiLang === 'id'
-        ? `Mengirim rekaman EKG ${imageToAnalyze.width}×${imageToAnalyze.height} px (${imageToAnalyze.orientationDescription}) ke mesin AI...`
-        : `Transmitting ${imageToAnalyze.width}×${imageToAnalyze.height} px ECG (${imageToAnalyze.orientationDescription}) to AI API...`
+        ? `Mengirim rekaman EKG ${imageToAnalyze.width}×${imageToAnalyze.height} px (${imageToAnalyze.orientationDescription}) ke mesin AI resolusi tinggi...`
+        : `Transmitting ${imageToAnalyze.width}×${imageToAnalyze.height} px ECG (${imageToAnalyze.orientationDescription}) to high-res AI Vision...`
     );
 
     const stageTimer = setTimeout(() => {
       setAnalysisStageText(
         uiLang === 'id'
-          ? 'Mengevaluasi gelombang 12 sadapan, interval PR/QRS/QTc, aksis listrik, serta perbandingan teks mesin EKG...'
-          : 'Evaluating 12-lead waveforms, intervals, electrical axis, and printed machine interpretation...'
+          ? 'Tahap 1: Mengevaluasi 12 sadapan, kotak milimeter PR/QRS/QTc, aksis Cabrera & teks mesin EKG...'
+          : 'Pass 1: Evaluating 12 leads, millimeter grid PR/QRS/QTc, Cabrera axis & printed machine header...'
       );
     }, 2400);
+
+    const auditStageTimer =
+      effectiveMode === 'verified'
+        ? setTimeout(() => {
+            setAnalysisStageText(
+              uiLang === 'id'
+                ? 'Tahap 2: Menjalankan Audit Konsistensi Klinis & pemeriksaan silang matematis QTc/Aksis...'
+                : 'Pass 2: Running Senior Clinical Consistency Audit & mathematical QTc/Axis cross-check...'
+            );
+          }, 10500)
+        : null;
 
     const trimmedContext: ClinicalContextInput = {
       patientAgeSex: clinicalContext.patientAgeSex?.trim() || undefined,
@@ -326,6 +349,8 @@ export default function App() {
           fileName: imageToAnalyze.file.name,
           orientationNote: `${imageToAnalyze.orientationDescription} (${imageToAnalyze.width}x${imageToAnalyze.height}px)`,
           reportLanguage,
+          analysisMode: effectiveMode,
+          bypassCache: Boolean(runOptions?.bypassCache),
           clinicalContext: hasContext ? trimmedContext : undefined,
         }),
         signal: controller.signal,
@@ -364,12 +389,17 @@ export default function App() {
         ? String(payload.modelUsed).replace(/gemini/gi, 'AI')
         : 'AI Multimodal Vision';
       const timestamp = payload.analyzedAt || new Date().toISOString();
+      const verificationMeta: VerificationMetadata | undefined =
+        payload.verification && typeof payload.verification === 'object'
+          ? (payload.verification as VerificationMetadata)
+          : undefined;
 
       const thumbnailDataUrl = await createCompactThumbnail(imageToAnalyze.previewDataUrl);
 
       setReport(validatedReport);
       setActiveReportContext(hasContext ? trimmedContext : undefined);
       setActiveHistoryThumbnail(thumbnailDataUrl);
+      setActiveVerification(verificationMeta);
       setModelUsed(cleanModelName);
       setAnalyzedAt(timestamp);
 
@@ -381,6 +411,7 @@ export default function App() {
         modelUsed: cleanModelName,
         reportLanguage,
         clinicalContext: hasContext ? trimmedContext : undefined,
+        verification: verificationMeta,
         thumbnailDataUrl,
         report: validatedReport,
       };
@@ -398,8 +429,12 @@ export default function App() {
       pushToast(
         'success',
         uiLang === 'id'
-          ? 'Analisis EKG 12-lead selesai dan tersimpan di Riwayat.'
-          : '12-lead ECG analysis completed and saved to History.'
+          ? verificationMeta?.dualPassCompleted
+            ? 'Analisis EKG selesai (Terverifikasi Audit Klinis 2-Tahap + Validasi Matematis).'
+            : 'Analisis EKG 12-lead selesai dan tersimpan di Riwayat.'
+          : verificationMeta?.dualPassCompleted
+            ? 'ECG analysis completed (2-Pass Clinical Audit + Math Verified).'
+            : '12-lead ECG analysis completed and saved to History.'
       );
     } catch (err: unknown) {
       if (err instanceof DOMException && err.name === 'AbortError') {
@@ -419,6 +454,9 @@ export default function App() {
       }
     } finally {
       clearTimeout(stageTimer);
+      if (auditStageTimer) {
+        clearTimeout(auditStageTimer);
+      }
       setIsAnalyzing(false);
       abortControllerRef.current = null;
     }
@@ -453,6 +491,34 @@ export default function App() {
     }
   };
 
+  const handleRotateImage = async () => {
+    if (!selectedImage || isAnalyzing) return;
+    try {
+      const rotated = await rotateProcessedEcgImage90(selectedImage);
+      setSelectedImage(rotated);
+      pushToast(
+        'info',
+        uiLang === 'id'
+          ? 'Piksel gambar EKG berhasil diputar +90° searah jarum jam.'
+          : 'ECG image pixels rotated +90° clockwise.'
+      );
+    } catch {
+      pushToast(
+        'error',
+        uiLang === 'id'
+          ? 'Gagal memutar gambar EKG.'
+          : 'Failed to rotate ECG image.'
+      );
+    }
+  };
+
+  const handleReverifyFresh = () => {
+    if (!selectedImage || isAnalyzing) return;
+    setActiveTab('analyzer');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    executeAnalysis(selectedImage, { bypassCache: true, forceMode: 'verified' });
+  };
+
   const handleCancelAnalysis = () => {
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -467,6 +533,7 @@ export default function App() {
     setSelectedImage(null);
     setActiveHistoryThumbnail(undefined);
     setActiveReportContext(undefined);
+    setActiveVerification(undefined);
     setErrorMessage(null);
     setActiveTab('analyzer');
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -477,6 +544,7 @@ export default function App() {
     setSelectedImage(null);
     setActiveHistoryThumbnail(item.thumbnailDataUrl);
     setActiveReportContext(item.clinicalContext);
+    setActiveVerification(item.verification);
     setModelUsed(item.modelUsed || 'AI Multimodal Vision');
     setAnalyzedAt(item.analyzedAt);
     setActiveTab('report');
@@ -607,6 +675,7 @@ export default function App() {
               setSelectedImage(null);
               setErrorMessage(null);
             }}
+            onRotateImage={handleRotateImage}
             onLoadSampleEcg={handleLoadSampleEcg}
             onOpenDisclosureTab={() => setActiveTab('disclosure')}
             onOpenCalculator={() => setIsCalculatorModalOpen(true)}
@@ -620,6 +689,8 @@ export default function App() {
             onChangeClinicalContext={setClinicalContext}
             reportLanguage={reportLanguage}
             onChangeReportLanguage={setReportLanguage}
+            analysisMode={analysisMode}
+            onChangeAnalysisMode={setAnalysisMode}
             uiLang={uiLang}
             onPasteSuccess={() =>
               pushToast(
@@ -638,9 +709,11 @@ export default function App() {
             image={selectedImage}
             fallbackImageUrl={activeHistoryThumbnail}
             clinicalContext={activeReportContext}
+            verification={activeVerification}
             modelUsed={modelUsed}
             analyzedAt={analyzedAt}
             onAnalyzeAnother={handleResetAndNewAnalysis}
+            onReverifyFresh={selectedImage ? handleReverifyFresh : undefined}
             onOpenCalculator={() => setIsCalculatorModalOpen(true)}
             onNotify={pushToast}
             uiLang={uiLang}

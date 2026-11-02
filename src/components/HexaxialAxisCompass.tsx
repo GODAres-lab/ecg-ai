@@ -10,7 +10,11 @@ interface HexaxialAxisCompassProps {
 
 function parseDegreeValue(raw?: string): number | null {
   if (!raw || typeof raw !== 'string') return null;
-  const cleaned = raw.replace(/°/g, '').trim();
+  const cleaned = raw
+    .replace(/[\u2212\u2013\u2014]/g, '-')
+    .replace(/^(approx\.?|approximately|sekitar|~|≈)\s*/i, '')
+    .replace(/°/g, '')
+    .trim();
   const match = cleaned.match(/^[+-]?\d+(\.\d+)?/);
   if (!match) return null;
   const num = parseFloat(match[0]);
