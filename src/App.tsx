@@ -302,31 +302,37 @@ export default function App() {
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
+    const dspBadge =
+      imageToAnalyze.pixelTelemetry?.gridDetected &&
+      imageToAnalyze.pixelTelemetry?.estimatedHrBpm
+        ? ` • Pixel-DSP ${imageToAnalyze.pixelTelemetry.estimatedHrBpm} bpm`
+        : '';
+
     setIsAnalyzing(true);
     setErrorMessage(null);
     setAnalysisStageText(
       uiLang === 'id'
-        ? `Mengirim rekaman EKG ${imageToAnalyze.width}×${imageToAnalyze.height} px (${imageToAnalyze.orientationDescription}) ke mesin AI resolusi tinggi...`
-        : `Transmitting ${imageToAnalyze.width}×${imageToAnalyze.height} px ECG (${imageToAnalyze.orientationDescription}) to high-res AI Vision...`
+        ? `Mengirim EKG ${imageToAnalyze.width}×${imageToAnalyze.height} px + ${1 + (effectiveMode === 'verified' ? imageToAnalyze.diagnosticTiles?.length || 0 : 0)} Tile Zoom HD${dspBadge}...`
+        : `Transmitting ${imageToAnalyze.width}×${imageToAnalyze.height} px ECG + ${1 + (effectiveMode === 'verified' ? imageToAnalyze.diagnosticTiles?.length || 0 : 0)} HD Zoom Tiles${dspBadge}...`
     );
 
     const stageTimer = setTimeout(() => {
       setAnalysisStageText(
         uiLang === 'id'
-          ? 'Tahap 1: Mengevaluasi 12 sadapan, kotak milimeter PR/QRS/QTc, aksis Cabrera & teks mesin EKG...'
-          : 'Pass 1: Evaluating 12 leads, millimeter grid PR/QRS/QTc, Cabrera axis & printed machine header...'
+          ? 'Tahap 1: Mengukur kotak milimeter 2× Zoom (PR/QRS/QT), kalibrasi Pixel-DSP & trigonometri aksis Goldberger...'
+          : 'Stage 1: Measuring 2× Zoom millimeter grid boxes (PR/QRS/QT), Pixel-DSP cadence & Goldberger axis trigonometry...'
       );
-    }, 2400);
+    }, 2200);
 
     const auditStageTimer =
       effectiveMode === 'verified'
         ? setTimeout(() => {
             setAnalysisStageText(
               uiLang === 'id'
-                ? 'Tahap 2: Menjalankan Audit Konsistensi Klinis & pemeriksaan silang matematis QTc/Aksis...'
-                : 'Pass 2: Running Senior Clinical Consistency Audit & mathematical QTc/Axis cross-check...'
+                ? 'Tahap 2: Memverifikasi konsistensi matematis 14-seksi (Bazett/Fridericia QTc, Cabrera & ST-T kontigu)...'
+                : 'Stage 2: Verifying 14-section mathematical consistency (Bazett/Fridericia QTc, Cabrera & contiguous ST-T)...'
             );
-          }, 10500)
+          }, 8200)
         : null;
 
     const trimmedContext: ClinicalContextInput = {
@@ -352,6 +358,9 @@ export default function App() {
           analysisMode: effectiveMode,
           bypassCache: Boolean(runOptions?.bypassCache),
           clinicalContext: hasContext ? trimmedContext : undefined,
+          pixelTelemetry: imageToAnalyze.pixelTelemetry,
+          diagnosticTiles:
+            effectiveMode === 'verified' ? imageToAnalyze.diagnosticTiles : undefined,
         }),
         signal: controller.signal,
       });

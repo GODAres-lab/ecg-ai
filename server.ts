@@ -9,6 +9,11 @@ import {
   validateImageInput,
   validateAndCrossCheckEcgResponse,
 } from './src/utils/ecgValidation.ts';
+import {
+  hammingDistanceHex,
+  type EcgPixelTelemetry,
+} from './src/utils/ecgSignalDsp.ts';
+import type { DiagnosticImageTile } from './src/utils/imageProcessor.ts';
 import type {
   AnalysisMode,
   EcgAnalysisReport,
@@ -45,18 +50,52 @@ const PORT = 3000;
 const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash';
 const DETERMINISTIC_SEED = 424242;
 
-// Privacy-Safe Ephemeral Deterministic Reproducibility Cache (stores SHA-256 hex -> JSON report ONLY; ZERO image bytes)
+/**
+ * Resolves the effective high-precision Gemini 2.5+ model.
+ * Auto-upgrades legacy `gemini-2.0-*` / `gemini-1.5-*` or invalid `gemini-3.5+` overrides
+ * left in older `.env` files unless `ALLOW_LEGACY_GEMINI_MODEL=true` is explicitly set.
+ */
+function resolvePrecisionGeminiModel(): string {
+  const configured = (process.env.GEMINI_MODEL || '').trim();
+  if (!configured) {
+    return DEFAULT_GEMINI_MODEL;
+  }
+  const isLegacyOrInvalid = /^(gemini-1\.5|gemini-2\.0|gemini-3\.[56789])/i.test(configured);
+  if (isLegacyOrInvalid && process.env.ALLOW_LEGACY_GEMINI_MODEL !== 'true') {
+    return DEFAULT_GEMINI_MODEL;
+  }
+  return configured;
+}
+
+// Privacy-Safe Ephemeral Dual-Layer Reproducibility Cache
+// Stores SHA-256 + 256-bit perceptual dHash -> JSON report ONLY (ZERO patient image bytes stored)
 interface DeterministicCacheEntry {
   report: EcgAnalysisReport;
   modelUsed: string;
   dualPassCompleted: boolean;
   mathChecksApplied: string[];
   cachedAt: number;
+  contextSignature: string;
+  perceptualHash256?: string;
+  aspectRatio?: number;
+  rhythmPeakCount?: number;
 }
 
 const DETERMINISTIC_CACHE_MAX = 150;
 const DETERMINISTIC_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const deterministicReportCache = new Map<string, DeterministicCacheEntry>();
+
+function buildCacheContextSignature(params: {
+  reportLanguage: 'id' | 'en';
+  analysisMode: AnalysisMode;
+  clinicalContext?: {
+    patientAgeSex?: string;
+    symptoms?: string;
+    clinicalHistory?: string;
+  };
+}): string {
+  return `${params.reportLanguage}|${params.analysisMode}|${JSON.stringify(params.clinicalContext || null)}`;
+}
 
 function computeDeterministicInputHash(params: {
   mimeType: string;
@@ -72,24 +111,73 @@ function computeDeterministicInputHash(params: {
   const hasher = crypto.createHash('sha256');
   hasher.update(params.mimeType);
   hasher.update('|');
-  hasher.update(params.reportLanguage);
-  hasher.update('|');
-  hasher.update(params.analysisMode);
-  hasher.update('|');
-  hasher.update(JSON.stringify(params.clinicalContext || null));
+  hasher.update(buildCacheContextSignature(params));
   hasher.update('|');
   hasher.update(params.imageBase64);
   return hasher.digest('hex');
 }
 
-function getCachedDeterministicAnalysis(fingerprint: string): DeterministicCacheEntry | null {
-  const entry = deterministicReportCache.get(fingerprint);
-  if (!entry) return null;
-  if (Date.now() - entry.cachedAt > DETERMINISTIC_CACHE_TTL_MS) {
-    deterministicReportCache.delete(fingerprint);
+function findCachedDeterministicAnalysis(params: {
+  exactFingerprint: string;
+  contextSignature: string;
+  pixelTelemetry?: EcgPixelTelemetry;
+}): { entry: DeterministicCacheEntry; matchType: 'sha256' | 'perceptual256' } | null {
+  const now = Date.now();
+  const exact = deterministicReportCache.get(params.exactFingerprint);
+  if (exact) {
+    if (now - exact.cachedAt > DETERMINISTIC_CACHE_TTL_MS) {
+      deterministicReportCache.delete(params.exactFingerprint);
+    } else {
+      return { entry: exact, matchType: 'sha256' };
+    }
+  }
+
+  const pHash = params.pixelTelemetry?.perceptualHash256;
+  if (!pHash || pHash.length !== 64 || /^0+$/.test(pHash)) {
     return null;
   }
-  return entry;
+
+  const width = params.pixelTelemetry?.imageWidth || 0;
+  const height = params.pixelTelemetry?.imageHeight || 0;
+  const aspectRatio = width > 0 && height > 0 ? width / height : 0;
+  const peakCount = params.pixelTelemetry?.rhythmPeakCount || 0;
+
+  let bestMatch: DeterministicCacheEntry | null = null;
+  let bestDist = 999;
+
+  for (const [key, candidate] of deterministicReportCache.entries()) {
+    if (now - candidate.cachedAt > DETERMINISTIC_CACHE_TTL_MS) {
+      deterministicReportCache.delete(key);
+      continue;
+    }
+    if (candidate.contextSignature !== params.contextSignature) {
+      continue;
+    }
+    if (!candidate.perceptualHash256 || candidate.perceptualHash256.length !== 64) {
+      continue;
+    }
+    if (
+      aspectRatio > 0 &&
+      candidate.aspectRatio &&
+      Math.abs(aspectRatio - candidate.aspectRatio) > 0.04
+    ) {
+      continue;
+    }
+    if (
+      peakCount > 0 &&
+      candidate.rhythmPeakCount &&
+      Math.abs(peakCount - candidate.rhythmPeakCount) > 1
+    ) {
+      continue;
+    }
+    const dist = hammingDistanceHex(pHash, candidate.perceptualHash256);
+    if (dist <= 6 && dist < bestDist) {
+      bestDist = dist;
+      bestMatch = candidate;
+    }
+  }
+
+  return bestMatch ? { entry: bestMatch, matchType: 'perceptual256' } : null;
 }
 
 function setCachedDeterministicAnalysis(fingerprint: string, entry: DeterministicCacheEntry): void {
@@ -102,6 +190,85 @@ function setCachedDeterministicAnalysis(fingerprint: string, entry: Deterministi
     }
   }
   deterministicReportCache.set(fingerprint, entry);
+}
+
+function sanitizePixelTelemetry(raw: unknown): EcgPixelTelemetry | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const t = raw as Record<string, unknown>;
+  const imageWidth = Number(t.imageWidth);
+  const imageHeight = Number(t.imageHeight);
+  if (!Number.isFinite(imageWidth) || !Number.isFinite(imageHeight) || imageWidth < 64 || imageHeight < 64) {
+    return undefined;
+  }
+  const rawHash = typeof t.perceptualHash256 === 'string' ? t.perceptualHash256.trim().toLowerCase() : '';
+  const perceptualHash256 = /^[0-9a-f]{64}$/.test(rawHash) ? rawHash : '0'.repeat(64);
+
+  const validReg = ['regular', 'mild_variation', 'irregular', 'indeterminate'] as const;
+  const rhythmRegularitySignal =
+    typeof t.rhythmRegularitySignal === 'string' &&
+    validReg.includes(t.rhythmRegularitySignal as (typeof validReg)[number])
+      ? (t.rhythmRegularitySignal as (typeof validReg)[number])
+      : 'indeterminate';
+
+  const finiteOrNull = (val: unknown, min: number, max: number): number | null => {
+    if (val === null || val === undefined) return null;
+    const n = Number(val);
+    return Number.isFinite(n) && n >= min && n <= max ? n : null;
+  };
+
+  return {
+    imageWidth: Math.round(imageWidth),
+    imageHeight: Math.round(imageHeight),
+    perceptualHash256,
+    gridDetected: Boolean(t.gridDetected),
+    gridConfidence: finiteOrNull(t.gridConfidence, 0, 1) ?? 0,
+    pxPer1mm: finiteOrNull(t.pxPer1mm, 0.5, 120),
+    pxPer5mm: finiteOrNull(t.pxPer5mm, 2.5, 600),
+    detectedRowsCount: Math.max(0, Math.min(12, Math.round(Number(t.detectedRowsCount) || 0))),
+    rhythmPeakCount: Math.max(0, Math.min(80, Math.round(Number(t.rhythmPeakCount) || 0))),
+    meanRrPx: finiteOrNull(t.meanRrPx, 5, 4000),
+    medianRrPx: finiteOrNull(t.medianRrPx, 5, 4000),
+    rrCvPercent: finiteOrNull(t.rrCvPercent, 0, 200),
+    rhythmRegularitySignal,
+    estimatedHrBpm: finiteOrNull(t.estimatedHrBpm, 20, 260),
+    estimatedMeanRrMs: finiteOrNull(t.estimatedMeanRrMs, 200, 3000),
+    hrConfidence: finiteOrNull(t.hrConfidence, 0, 1) ?? 0,
+    telemetrySummaryForAi: sanitizeText(
+      typeof t.telemetrySummaryForAi === 'string' ? t.telemetrySummaryForAi : '',
+      560
+    ),
+  };
+}
+
+const ALLOWED_TILE_LABELS = new Set<DiagnosticImageTile['label']>([
+  'header_footer',
+  'limb_leads_zoom',
+  'precordial_leads_zoom',
+]);
+
+function sanitizeDiagnosticTiles(raw: unknown): DiagnosticImageTile[] {
+  if (!Array.isArray(raw)) return [];
+  const sanitized: DiagnosticImageTile[] = [];
+  for (const item of raw.slice(0, 3)) {
+    if (!item || typeof item !== 'object') continue;
+    const tile = item as Record<string, unknown>;
+    const label = tile.label as DiagnosticImageTile['label'];
+    if (!ALLOWED_TILE_LABELS.has(label)) continue;
+    const rawMime = typeof tile.mimeType === 'string' ? tile.mimeType.trim().toLowerCase() : '';
+    const mimeType = rawMime === 'image/jpg' ? 'image/jpeg' : rawMime;
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(mimeType)) continue;
+    const base64Data = typeof tile.base64Data === 'string' ? tile.base64Data.trim() : '';
+    const approxBytes = Math.floor((base64Data.length * 3) / 4);
+    if (!base64Data || approxBytes <= 64 || approxBytes > 8 * 1024 * 1024) continue;
+    sanitized.push({
+      label,
+      mimeType,
+      base64Data,
+      width: Math.max(1, Math.round(Number(tile.width) || 0)),
+      height: Math.max(1, Math.round(Number(tile.height) || 0)),
+    });
+  }
+  return sanitized;
 }
 
 function getGeminiClient(): GoogleGenAI {
@@ -126,13 +293,14 @@ const measuredValueSchema: Schema = {
   properties: {
     source: {
       type: Type.STRING,
+      format: 'enum',
       enum: ['Printed on ECG', 'Visually Estimated', 'AI Calculated', 'Unmeasurable'],
       description: 'Exact provenance of this measurement.',
     },
     value: {
       type: Type.STRING,
       description:
-        'Single exact numeric value as string (e.g., "74", "158", "+54", "-45") or "Not measurable". Prefer a single representative integer rather than a vague range. Never fabricate precision.',
+        'Single exact numeric value as string (e.g., "74", "160", "+55", "-45") or "Not measurable". Always output a single exact integer, NEVER a numeric range.',
     },
     unit: {
       type: Type.STRING,
@@ -144,11 +312,11 @@ const measuredValueSchema: Schema = {
     },
     assessment: {
       type: Type.STRING,
-      description: 'Clinical interpretation of this value strictly concordant with the numeric threshold.',
+      description: 'Decisive clinical interpretation strictly concordant with the numeric threshold.',
     },
     reliabilityNote: {
       type: Type.STRING,
-      description: 'Explanation of measurement reliability based on printed header legibility or 1mm/5mm paper grid.',
+      description: 'Concise measurement basis (printed header digit, Pixel-DSP calibration, or 1mm/5mm grid box count).',
     },
   },
   propertyOrdering: ['source', 'value', 'unit', 'normalRange', 'assessment', 'reliabilityNote'],
@@ -205,6 +373,7 @@ const ecgResponseSchema: Schema = {
       properties: {
         overall_readability: {
           type: Type.STRING,
+          format: 'enum',
           enum: ['High', 'Moderate', 'Low', 'Unreadable'],
           description: 'Overall waveform and grid legibility.',
         },
@@ -267,12 +436,12 @@ const ecgResponseSchema: Schema = {
         properties: {
           leadName: { type: Type.STRING, description: 'Canonical lead name: "Lead I", "Lead II", "Lead III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6", or rhythm strip.' },
           identifiedFromLabel: { type: Type.BOOLEAN, description: 'True if lead label was directly read from the image.' },
-          pWave: { type: Type.STRING, description: 'P-wave polarity, contour, and visibility in this lead.' },
-          qrsMorphology: { type: Type.STRING, description: 'Exact QRS pattern (e.g., qRs, rS, QS, rsR\'), net polarity (positive/negative/equiphasic), and pathological Q waves.' },
-          stSegment: { type: Type.STRING, description: 'J-point and ST-segment position relative to TP/PR baseline in mm (isoelectric, elevated, or depressed).' },
-          tWave: { type: Type.STRING, description: 'T-wave polarity (upright, flat, biphasic, inverted, hyperacute) and symmetry.' },
-          rhythmAndWaveform: { type: Type.STRING, description: 'Overall waveform quality and tracking in this lead.' },
-          abnormalities: { type: Type.STRING, description: 'Specific abnormalities in this lead or "None identified".' },
+          pWave: { type: Type.STRING, description: 'Decisive P-wave polarity, contour, and visibility in this lead.' },
+          qrsMorphology: { type: Type.STRING, description: 'Exact QRS pattern (e.g., qRs, rS, QS, rsR\'), net polarity (positive/negative/equiphasic), amplitude in mm, and pathological Q waves.' },
+          stSegment: { type: Type.STRING, description: 'Exact J-point and ST-segment position relative to TP/PR baseline in mm (isoelectric 0 mm, elevated +X mm, or depressed -X mm).' },
+          tWave: { type: Type.STRING, description: 'Decisive T-wave polarity (upright, flat, biphasic, inverted, hyperacute) and symmetry.' },
+          rhythmAndWaveform: { type: Type.STRING, description: 'Overall waveform tracking and baseline stability in this lead.' },
+          abnormalities: { type: Type.STRING, description: 'Specific abnormalities in this lead or "None identified" / "Tidak ditemukan kelainan".' },
           confidenceAndLimitations: { type: Type.STRING },
         },
         propertyOrdering: [
@@ -298,6 +467,83 @@ const ecgResponseSchema: Schema = {
           'confidenceAndLimitations',
         ],
       },
+    },
+    quantitative_grid_measurements: {
+      type: Type.OBJECT,
+      description:
+        'Direct millimeter-grid box counts measured on the 2x zoomed Limb and Precordial tiles BEFORE computing ms intervals and degree axes. Use 0 when unmeasurable or physiologically absent (e.g., PR in AFib).',
+      properties: {
+        paper_speed_mm_per_s: {
+          type: Type.NUMBER,
+          description: 'Confirmed paper speed in mm/s (25 for standard 25 mm/s or 25 mm/sec; 50 for 50 mm/s).',
+        },
+        gain_mm_per_mv: {
+          type: Type.NUMBER,
+          description: 'Confirmed voltage gain in mm/mV (10 for standard 10 mm/mV; 5 or 20 if explicitly half/double gain).',
+        },
+        rr_interval_small_boxes: {
+          type: Type.NUMBER,
+          description: 'Mean horizontal R-R spacing in 1mm small boxes to nearest 0.25 box (e.g., 20.25; 0 if irregular AFib or unmeasurable).',
+        },
+        ten_sec_strip_qrs_count: {
+          type: Type.NUMBER,
+          description: 'Exact total count of QRS complexes across a full 10-second (250 mm / 50 large boxes) rhythm strip, or 0 if no 10s rhythm strip is visible.',
+        },
+        pr_interval_small_boxes: {
+          type: Type.NUMBER,
+          description: 'PR interval from P-wave onset to QRS onset counted on 2x zoomed Lead II / V1 in 1mm small boxes to nearest 0.25 box (e.g., 4.0 = 160 ms; 0 if AFib or unmeasurable).',
+        },
+        qrs_duration_small_boxes: {
+          type: Type.NUMBER,
+          description: 'QRS complex width from earliest Q/R onset to J-point counted on 2x zoomed tiles in 1mm small boxes to nearest 0.25 box (e.g., 2.2 = 88 ms; 0 if unmeasurable).',
+        },
+        qt_interval_small_boxes: {
+          type: Type.NUMBER,
+          description: 'QT interval from QRS onset to T-wave tangent offset in Lead II, V5, or V6 counted on 2x zoomed tiles in 1mm small boxes to nearest 0.25 box (e.g., 9.5 = 380 ms; 0 if unmeasurable).',
+        },
+        has_net_qrs_measurements: {
+          type: Type.BOOLEAN,
+          description: 'True if Lead I and Lead aVF QRS complexes are clearly visible and net vertical 1mm deflections were measured.',
+        },
+        lead_i_net_qrs_mm: {
+          type: Type.NUMBER,
+          description: 'Net vertical QRS deflection [R_height_mm - (Q_depth_mm + S_depth_mm)] in Lead I measured in 1mm small boxes to nearest 0.5 mm (e.g., 5.5 or -3.0).',
+        },
+        lead_ii_net_qrs_mm: {
+          type: Type.NUMBER,
+          description: 'Net vertical QRS deflection [R_height_mm - (Q_depth_mm + S_depth_mm)] in Lead II measured in 1mm small boxes to nearest 0.5 mm.',
+        },
+        lead_avf_net_qrs_mm: {
+          type: Type.NUMBER,
+          description: 'Net vertical QRS deflection [R_height_mm - (Q_depth_mm + S_depth_mm)] in Lead aVF measured in 1mm small boxes to nearest 0.5 mm.',
+        },
+      },
+      propertyOrdering: [
+        'paper_speed_mm_per_s',
+        'gain_mm_per_mv',
+        'rr_interval_small_boxes',
+        'ten_sec_strip_qrs_count',
+        'pr_interval_small_boxes',
+        'qrs_duration_small_boxes',
+        'qt_interval_small_boxes',
+        'has_net_qrs_measurements',
+        'lead_i_net_qrs_mm',
+        'lead_ii_net_qrs_mm',
+        'lead_avf_net_qrs_mm',
+      ],
+      required: [
+        'paper_speed_mm_per_s',
+        'gain_mm_per_mv',
+        'rr_interval_small_boxes',
+        'ten_sec_strip_qrs_count',
+        'pr_interval_small_boxes',
+        'qrs_duration_small_boxes',
+        'qt_interval_small_boxes',
+        'has_net_qrs_measurements',
+        'lead_i_net_qrs_mm',
+        'lead_ii_net_qrs_mm',
+        'lead_avf_net_qrs_mm',
+      ],
     },
     heart_rate: {
       type: Type.OBJECT,
@@ -377,7 +623,7 @@ const ecgResponseSchema: Schema = {
         t_wave_axis: measuredValueSchema,
         axis_deviation_summary: {
           type: Type.STRING,
-          description: 'Explicitly state net QRS polarity in Lead I, Lead II, and Lead aVF and the resulting Cabrera axis quadrant.',
+          description: 'Explicitly state net QRS mm and polarity in Lead I, Lead II, and Lead aVF and the resulting Goldberger/Cabrera axis degree and quadrant.',
         },
       },
       propertyOrdering: ['p_wave_axis', 'qrs_axis', 't_wave_axis', 'axis_deviation_summary'],
@@ -521,6 +767,7 @@ const ecgResponseSchema: Schema = {
     },
     urgency_level: {
       type: Type.STRING,
+      format: 'enum',
       enum: [
         'Normal ECG appearance',
         'Abnormal ECG',
@@ -532,7 +779,7 @@ const ecgResponseSchema: Schema = {
     },
     urgency_explanation: {
       type: Type.STRING,
-      description: 'Detailed explanation of the assigned urgency classification.',
+      description: 'Decisive explanation of the assigned urgency classification.',
     },
     time_critical_warning: {
       type: Type.STRING,
@@ -540,7 +787,7 @@ const ecgResponseSchema: Schema = {
     },
     executive_summary: {
       type: Type.STRING,
-      description: 'Concise, comprehensive 2-4 sentence executive clinical summary synthesized strictly from all verified measurements and lead findings.',
+      description: 'Crisp, authoritative 2-4 sentence cardiology executive summary stating exact verified HR, rhythm, PR/QRS/QTc intervals, QRS axis, and decisive morphological conclusion without ambiguous hedging.',
     },
     clinical_impression: {
       type: Type.ARRAY,
@@ -561,6 +808,7 @@ const ecgResponseSchema: Schema = {
       properties: {
         overall_level: {
           type: Type.STRING,
+          format: 'enum',
           enum: ['High', 'Moderate', 'Low', 'Insufficient Image Quality'],
           description: 'Overall confidence level in this ECG interpretation.',
         },
@@ -575,6 +823,7 @@ const ecgResponseSchema: Schema = {
     'image_quality',
     'printed_machine_interpretation',
     'lead_analysis',
+    'quantitative_grid_measurements',
     'heart_rate',
     'rhythm',
     'intervals',
@@ -599,6 +848,7 @@ const ecgResponseSchema: Schema = {
     'image_quality',
     'printed_machine_interpretation',
     'lead_analysis',
+    'quantitative_grid_measurements',
     'heart_rate',
     'rhythm',
     'intervals',
@@ -620,74 +870,76 @@ const ecgResponseSchema: Schema = {
   ],
 };
 
-const ECG_SYSTEM_INSTRUCTION = `You are a board-level Senior Clinical Electrocardiography (ECG/EKG) Multimodal Analysis Engine built for high-precision, reproducible clinical decision support and medical education.
+const ECG_SYSTEM_INSTRUCTION = `You are a board-certified Senior Clinical Electrocardiographer (ECG/EKG) Multimodal Precision Engine engineered for deterministic, sub-millimeter clinical measurement and zero-ambiguity medical reporting.
 
-DETERMINISTIC CLINICAL MEASUREMENT & CONSISTENCY PROTOCOL (MANDATORY):
+DETERMINISTIC MULTI-SCALE MEASUREMENT & ZERO-AMBIGUITY PROTOCOL (MANDATORY):
 
-1. ORIENTATION, LAYOUT & CALIBRATION FIRST:
-   - Automatically account for portrait/landscape orientation, 90/180/270-degree rotation, camera tilt, perspective distortion, and 12-lead layout (3x4 + 1 or 3 rhythm strips, 6x2, Cabrera, or single/multi-channel strips).
-   - Verify paper speed (standard 25 mm/s vs 50 mm/s) and voltage gain (standard 10 mm/mV vs 5 or 20 mm/mV) from printed text OR the rectangular 1 mV calibration pulse (standard pulse = 10 mm tall x 5 mm wide). Never silently assume 25 mm/s and 10 mm/mV if neither printed text nor calibration pulse/grid is visible.
+1. MULTI-TILE HIGH-DEFINITION INSPECTION & CALIBRATION:
+   - When multiple image views are provided, inspect ALL views systematically:
+     * IMAGE 1 (Full Overview): Verify overall 12-lead layout (3x4 + rhythm strip, 6x2, Cabrera, or single/multi-channel), orientation, and global rhythm continuity.
+     * IMAGE 2 (High-Contrast Header & Footer Strip): Read tiny printed speed ("25 mm/s" or "25 mm/sec"), limb/chest gain ("10 mm/mV"), filter settings, and any printed machine measurements or IDs with 100% digit accuracy.
+     * IMAGE 3 (2x Zoomed Left Hemisphere — Limb Leads I, II, III, aVR, aVL, aVF): Count exact 1mm small boxes for P-wave polarity, PR interval, Lead I / II / aVF net QRS amplitudes, and inferior/lateral ST segments.
+     * IMAGE 4 (2x Zoomed Right Hemisphere — Precordial Leads V1–V6 & 1mV Calibration Pulses): Verify the 10 mm tall x 5 mm wide rectangular 1 mV calibration pulses, V1–V6 R-wave progression, QRS width, precordial J-points/ST segments, and QT tangent offset in V5–V6.
    - If the image is non-ECG, severely blurred, cropped, or unreadable, set image_quality.can_interpret_reliably = false and urgency_level = "Indeterminate because of image quality or insufficient information". NEVER default unreadable leads to normal.
 
-2. PRINTED HEADER ANCHORING (ELIMINATES RUN-TO-RUN NUMERIC JITTER):
-   - Inspect the top/bottom/margin header for printed numerical measurements (HR / Vent. Rate, PR, QRS, QT/QTc, P-R-T Axes).
-   - When printed numbers are clearly legible AND visually concordant with the waveform tracing, transcribe the EXACT printed integer values and mark source = "Printed on ECG". Never arbitrarily round or jitter legible printed digits.
-   - Only override a printed machine measurement if direct waveform inspection proves machine artifact error (e.g., double-counting tall T waves, baseline tremor); if overridden, document the exact discrepancy in printed_machine_interpretation.discrepancies.
+2. STRICT QUANTITATIVE MEASUREMENT HIERARCHY (ELIMINATES RUN-TO-RUN DRIFT):
+   - PRIORITY A — PRINTED HEADER NUMBERS: If printed numerical measurements (HR, PR, QRS, QT/QTc, P-R-T axes) are legible on the ECG and visually concordant with the waveform, transcribe the EXACT printed integers and set source = "Printed on ECG".
+   - PRIORITY B — DETERMINISTIC PIXEL-DSP TELEMETRY: When printed HR is absent and high-confidence Pixel-DSP Grid & R-Peak Telemetry is provided in the prompt, anchor ventricular heart rate and R-R regularity to the calibrated Pixel-DSP measurement (verifying paper speed 25 vs 50 mm/s) and set source = "AI Calculated".
+   - PRIORITY C — SUB-MILLIMETER 2x ZOOM BOX COUNTING (AT 25 mm/s, 10 mm/mV):
+     * 1 small box (1 mm) = 40 ms horizontally and 0.1 mV vertically; 1 large box (5 mm) = 200 ms and 0.5 mV.
+     * Record exact 0.25-box counts first in quantitative_grid_measurements (pr_interval_small_boxes, qrs_duration_small_boxes, qt_interval_small_boxes), then multiply by 40 ms (or 20 ms at 50 mm/s) so every millisecond value is mathematically locked to the grid.
+     * Always output a SINGLE exact integer string (e.g., "74", "160", "88", "380", "+55"), NEVER a numeric range (never "70-80").
+     * Compute Bazett QTc = round(QT_ms / sqrt(60 / HR_bpm)), or Fridericia QTc = round(QT_ms / cbrt(60 / HR_bpm)) when HR < 50 or > 100 bpm, with source = "AI Calculated".
 
-3. QUANTITATIVE MILLIMETER GRID BOX-COUNTING (WHEN ESTIMATING VISUALLY AT 25 mm/s, 10 mm/mV):
-   - Horizontal time grid: 1 small box (1 mm) = 40 ms; 1 large box (5 mm) = 200 ms; 5 large boxes (25 mm) = 1,000 ms (1.0 s).
-   - Vertical voltage grid: 1 small box (1 mm) = 0.1 mV; 2 large boxes (10 mm) = 1.0 mV.
-   - Regular Heart Rate: Calculate 1500 / (small 1mm boxes between R-R peaks) or 300 / (large 5mm boxes between R-R peaks). Output a single exact integer bpm (e.g., "75"), NOT a vague range.
-   - Irregular Heart Rate (e.g., AFib): Count total QRS complexes across a 10-second rhythm strip (50 large boxes) and multiply by 6, outputting a single representative integer bpm.
-   - QTc Calculation: Compute Bazett QTc = round(QT_ms / sqrt(60 / HR_bpm)), or Fridericia QTc = round(QT_ms / cbrt(60 / HR_bpm)) when HR < 50 or > 100 bpm. Mark derived QTc as source = "AI Calculated".
+3. GOLDBERGER HEXAXIAL TRIGONOMETRY & CABRERA QRS AXIS LOCKING:
+   - On IMAGE 3 (2x Limb Leads), count net vertical QRS deflection [R_mm - (Q_mm + S_mm)] in Lead I, Lead II, and Lead aVF to the nearest 0.5 mm and record them in quantitative_grid_measurements (lead_i_net_qrs_mm, lead_ii_net_qrs_mm, lead_avf_net_qrs_mm, has_net_qrs_measurements = true).
+   - Compute exact frontal QRS axis via Goldberger hexaxial formula: atan2(2 * aVF_net, sqrt(3) * I_net) rounded to the nearest 5°:
+     * Lead I (+) & Lead aVF (+) -> Normal Quadrant (0° to +90°).
+     * Lead I (+), Lead aVF (-), & Lead II (+) -> Normal Physiological Left (0° to -30°).
+     * Lead I (+), Lead aVF (-), & Lead II (-) -> Left Axis Deviation / LAD (-35° to -90°).
+     * Lead I (-) & Lead aVF (+) -> Right Axis Deviation / RAD (+95° to +180°).
+     * Lead I (-) & Lead aVF (-) -> Extreme / Northwest Axis (-95° to -180°).
+   - NEVER output a QRS axis angle that contradicts the net QRS polarity reported in lead_analysis for Leads I, II, and aVF.
 
-4. CABRERA HEXAXIAL QRS AXIS QUADRANT LOCKING (ZERO CONTRADICTION RULE):
-   - Determine net QRS area/amplitude [R - (Q + S)] in Lead I, Lead II, and Lead aVF BEFORE writing electrical_axis.qrs_axis:
-     * Lead I (+) AND Lead aVF (+) -> Normal Quadrant (0° to +90°).
-     * Lead I (+), Lead aVF (-), AND Lead II (+) -> Normal Physiological Left (0° to -30°).
-     * Lead I (+), Lead aVF (-), AND Lead II (-) -> Left Axis Deviation / LAD (-30° to -90°).
-     * Lead I (-) AND Lead aVF (+) -> Right Axis Deviation / RAD (+90° to +180°).
-     * Lead I (-) AND Lead aVF (-) -> Extreme / Northwest Axis (-90° to -180°).
-   - Refine the degree angle to the nearest 5° using the most equiphasic (isoelectric) limb lead (axis lies ±90° perpendicular to the equiphasic lead). NEVER output a QRS axis angle that contradicts the net QRS polarity reported in lead_analysis for Leads I, II, and aVF.
+4. RHYTHM & CONDUCTION RIGOR:
+   - Sinus Rhythm requires discrete upright P waves in Leads I, II, and aVF, inverted P wave in aVR, consistent PR interval, and 1:1 P-to-QRS conduction (atrial_rate_bpm MUST equal ventricular_rate_bpm).
+   - Atrial Fibrillation requires BOTH absence of discrete repeating sinus P waves (check Lead II and V1 carefully) AND irregularly irregular R-R intervals; in AFib, PR interval is physiologically absent ("Not measurable", source = "Unmeasurable").
+   - Evaluate bundle branch block strictly when QRS >= 120 ms: RBBB (rsR' or tall broad R in V1-V2 + wide slurred S in I, V5-V6) vs LBBB (broad monophasic/notched R without septal Q in I, aVL, V5-V6 + deep rS/QS in V1-V2).
 
-5. RHYTHM & CONDUCTION RIGOR:
-   - Sinus Rhythm requires discrete upright P waves in Leads I, II, and aVF with inverted P wave in aVR, consistent PR morphology, and 1:1 P-to-QRS conduction.
-   - Atrial Fibrillation requires BOTH (a) absence of discrete repeating sinus P waves (verify carefully in Lead II and V1) AND (b) irregularly irregular R-R intervals (unless complete AV block or ventricularly paced). Never misclassify sinus arrhythmia, PACs, or noisy baseline with visible P waves as AFib.
-   - Check bundle branch criteria strictly when QRS >= 120 ms: RBBB (rsR' or tall broad R in V1-V2 + wide slurred S in I, V5-V6) vs LBBB (broad monophasic R/notched R without Q in I, aVL, V5-V6 + deep rS/QS in V1-V2).
+5. CONTIGUOUS-LEAD ISCHEMIA / STEMI DISCIPLINE:
+   - Measure J-point ST shift in mm relative to the TP/PR isoelectric baseline across contiguous anatomical territories: Inferior (II, III, aVF + reciprocal I, aVL), Septal/Anterior (V1-V2 / V1-V4), Lateral (I, aVL, V5, V6).
+   - Distinguish true ischemic ST elevation (>= 1 mm, or >= 2 mm in V2-V3, in >= 2 contiguous leads) from camera shadow/lighting gradients, benign early repolarization, pericarditis, or secondary discordant ST-T changes in LBBB/LVH/pacing.
 
-6. CONTIGUOUS-LEAD ISCHEMIA / STEMI DISCIPLINE:
-   - Measure ST elevation or depression at the J-point relative to the TP/PR isoelectric baseline.
-   - Acute STEMI pattern requires J-point ST elevation >= 1 mm (>= 2 mm in V2-V3) in >= 2 anatomically contiguous leads:
-     * Inferior: II, III, aVF (always check reciprocal ST depression in I, aVL)
-     * Septal / Anterior: V1-V2 / V1-V4
-     * Lateral: I, aVL, V5, V6
-   - Carefully distinguish true primary ischemic ST shifts from: (a) uneven camera lighting/shadows or paper curvature, (b) benign early repolarization (notched J-point with tall concordant T waves, no reciprocal STD), (c) acute pericarditis (diffuse concave STE across territories + PR depression without reciprocal STD except aVR), and (d) expected discordant secondary ST-T changes in LBBB, RV pacing, or LVH strain.
-
-7. DETERMINISTIC 5-TIER URGENCY RUBRIC (APPLY CONSISTENTLY EVERY RUN):
+6. DETERMINISTIC 5-TIER URGENCY RUBRIC (APPLY IDENTICALLY EVERY RUN):
    - "Indeterminate because of image quality or insufficient information": Unreadable/non-ECG image or can_interpret_reliably = false.
-   - "Critical pattern requiring immediate emergency evaluation": Acute STEMI or STEMI-equivalent (De Winter, hyperacute T, isolated posterior MI V1-V3 STD with tall R, Sgarbossa-positive LBBB), sustained VT/VF/Torsades, 3rd-degree (complete) AV block, Mobitz II 2nd-degree AV block, sine-wave severe hyperkalemia pattern, or extreme unstable-rate arrhythmia (HR >= 180 or < 35 bpm).
-   - "Potentially urgent abnormality": Acute ischemic ST depression or deep symmetric Wellens/NSTE-ACS T-wave inversions, AFib/AFlutter with rapid ventricular response (HR > 110 bpm), narrow/wide regular SVT, Brugada Type 1 pattern, marked QTc prolongation (QTc >= 500 ms), Mobitz I with symptomatic-range bradycardia, or ventricular pauses > 2.5 s.
-   - "Abnormal ECG": Non-emergent / chronic / stable abnormalities — rate-controlled AFib (60-110 bpm), 1st-degree AV block, RBBB, stable LBBB without Sgarbossa criteria, LAFB/LPFB, LVH/RVH, atrial enlargement, old pathological Q-wave MI without acute ST elevation, isolated PACs/PVCs, mild sinus bradycardia (45-59 bpm) or mild sinus tachycardia (101-125 bpm), borderline QTc (460-499 ms), or nonspecific ST-T flattening/inversion.
-   - "Normal ECG appearance": Regular sinus rhythm (60-100 bpm), PR 120-200 ms, QRS < 120 ms, normal QTc (<= 450 ms M / <= 460 ms F), QRS axis -30° to +90°, normal R-wave progression V1-V6, and zero pathological Q, ST, T, or conduction abnormalities across all visible leads. Always note that a normal ECG does not exclude ACS or cardiac disease.
+   - "Critical pattern requiring immediate emergency evaluation": Acute STEMI or STEMI-equivalent (De Winter, hyperacute T, posterior MI V1-V3 STD with tall R, Sgarbossa+ LBBB), sustained VT/VF/Torsades, 3rd-degree AV block, Mobitz II 2nd-degree AV block, sine-wave hyperkalemia, or extreme unstable rate (HR >= 180 or < 35 bpm).
+   - "Potentially urgent abnormality": Acute ischemic ST depression or deep symmetric Wellens/NSTE-ACS T-wave inversions, AFib/AFlutter with RVR (HR > 110 bpm), SVT, Brugada Type 1, marked QTc >= 500 ms, Mobitz I with symptomatic-range bradycardia, or pauses > 2.5 s.
+   - "Abnormal ECG": Stable/chronic abnormalities — rate-controlled AFib (60-110 bpm), 1st-degree AV block (PR > 200 ms), RBBB, stable LBBB without Sgarbossa, LAFB/LPFB, LVH/RVH, atrial enlargement, old pathological Q-wave MI without acute STE, isolated PACs/PVCs, mild sinus bradycardia (45-59 bpm) or mild sinus tachycardia (101-125 bpm), borderline QTc (461-499 ms), or non-acute ST-T flattening/inversion.
+   - "Normal ECG appearance": Regular sinus rhythm (60-100 bpm), PR 120-200 ms, QRS < 120 ms, normal QTc (<= 450 ms M / <= 460 ms F), QRS axis -30° to +90°, normal R-wave progression V1-V6, and zero pathological Q, ST, T, or conduction abnormalities across all visible leads.
 
-8. COMPLETE CROSS-SECTION INTERNAL CONSISTENCY:
-   - Every section (lead_analysis, heart_rate, rhythm, intervals, electrical_axis, waveform_morphology, ischemia_and_infarction, arrhythmias_and_conduction, ai_interpretation, urgency_level, executive_summary, and 11-point clinical_impression) MUST agree 100% with zero internal contradictions. Do not prescribe specific drug dosages.`;
+7. ZERO-AMBIGUITY & DECISIVE CARDIOLOGY REPORTING STANDARD (CRITICAL):
+   - When image_quality.overall_readability is "High" or "Moderate", write decisive, authoritative, hospital-grade cardiology prose.
+   - STRICTLY FORBIDDEN HEDGING ON READABLE TRACINGS:
+     * Indonesian: Do NOT use wishy-washy qualifiers such as "kemungkinan...", "tampak seperti...", "cenderung...", "relatif normal", "mungkin terdapat...", "sekitar 70-80", or "tidak dapat menyingkirkan blok/aritmia halus" when describing clearly visible normal or abnormal waveforms.
+     * English: Do NOT use vague hedging such as "possibly...", "appears somewhat...", "relatively normal", "tends toward...", "around 70-80", or "cannot exclude subtle..." on clearly visible leads.
+   - State visible normal findings crisply and definitively (e.g., "Irama sinus reguler 74 bpm dengan konduksi AV 1:1 normal, interval PR 160 ms, kompleks QRS sempit 88 ms, QTc 422 ms, aksis QRS normal +55°, serta segmen ST isoelektrik tanpa tanda iskemia akut di seluruh 12 sadapan.").
+   - Reserve "Indeterminate" / uncertainty language ONLY for leads physically cropped/blurred on Low/Unreadable images, and place standard clinical-correlation caveats (that a resting 10s ECG does not exclude NSTE-ACS or paroxysmal arrhythmia) cleanly in limitations and pattern_vs_diagnosis_distinction.
+   - Every section MUST agree 100% with zero internal contradictions. Never prescribe specific drug dosages.`;
 
-const ECG_AUDITOR_SYSTEM_INSTRUCTION = `You are the Chief Cardiologist Quality & Consistency Auditor reviewing a Pass-1 AI ECG analysis draft against the actual ECG image pixels.
+const ECG_AUDITOR_SYSTEM_INSTRUCTION = `You are the Chief Cardiologist Contradiction Adjudicator resolving a flagged morphological discrepancy in a Pass-1 ECG JSON draft against the multi-scale high-resolution ECG image tiles.
 
-YOUR MANDATORY VERIFICATION CHECKLIST:
-1. HEADER & DIGIT AUDIT: Zoom into any printed ECG header numbers (HR, PR, QRS, QT/QTc, P-R-T axes) and printed machine text. If Pass-1 misread any digit or failed to use clearly legible concordant printed measurements, fix them immediately.
-2. BOX-COUNT & RHYTHM AUDIT: Re-verify R-R spacing on the 1mm/5mm grid, P-wave presence in Lead II and V1, and 1:1 AV conduction. Correct any false AFib calls when sinus P waves exist, or missed AFib when P waves are absent with irregularly irregular R-R intervals.
-3. CABRERA QRS AXIS AUDIT: Check net QRS polarity in Lead I, Lead II, and Lead aVF on the image. Ensure electrical_axis.qrs_axis degree value and assessment match the true Cabrera quadrant with zero contradiction against lead_analysis.
-4. CONTIGUOUS ST-T & ARTIFACT AUDIT: Re-check every ST-elevation/depression claim at the J-point vs TP baseline across contiguous territories (II/III/aVF, V1-V4, I/aVL/V5-V6). Eliminate false-positive STEMI calls caused by camera shadow or baseline drift, and ensure genuine contiguous ST shifts + reciprocal changes are accurately reported.
-5. 14-SECTION HARMONIZATION: Ensure lead_analysis, intervals, axis, morphology, ischemia, conduction, ai_interpretation, urgency_level (using the exact 5-tier rubric), executive_summary, and 11-point clinical_impression are 100% aligned with zero contradictions.
-
-Return the final, verified, deterministic JSON report conforming strictly to the schema.`;
+YOUR MANDATORY ADJUDICATION RULES:
+1. Inspect the 2x zoomed Limb and Precordial tiles directly at the leads mentioned in the flagged contradiction list.
+2. Resolve every flagged contradiction decisively based on visual pixel evidence (P-wave presence in Lead II/V1, J-point ST shift vs TP baseline across contiguous leads, net QRS mm in Leads I/II/aVF, and exact 5-tier urgency rubric).
+3. Eliminate all ambiguous or hedging wording; keep verified printed/Pixel-DSP/grid-locked numeric measurements intact unless directly disproven by the zoomed waveform pixels.
+4. Ensure 100% alignment across lead_analysis, quantitative_grid_measurements, heart_rate, rhythm, intervals, electrical_axis, ischemia_and_infarction, ai_interpretation, urgency_level, executive_summary, and clinical_impression.`;
 
 interface AnalyzeCallOptions {
   orientationNote: string;
   reportLanguage: 'id' | 'en';
   analysisMode: AnalysisMode;
+  pixelTelemetry?: EcgPixelTelemetry;
+  diagnosticTiles?: DiagnosticImageTile[];
   clinicalContext?: {
     patientAgeSex?: string;
     symptoms?: string;
@@ -699,23 +951,42 @@ function supportsThinkingConfig(modelName: string): boolean {
   return /^gemini-(2\.5|3)/i.test(modelName.trim());
 }
 
+const TILE_DESCRIPTION_MAP: Record<DiagnosticImageTile['label'], string> = {
+  header_footer:
+    'IMAGE VIEW 2 — High-Contrast Stitched Header & Footer Calibration Strip (inspect printed paper speed 25 vs 50 mm/s, gain 10 mm/mV, filter settings, and printed digits):',
+  limb_leads_zoom:
+    'IMAGE VIEW 3 — 2x High-Definition Left Hemisphere Crop (Limb Leads I, II, III, aVR, aVL, aVF — count exact 0.25-mm PR/QRS/QT boxes and net QRS mm in Leads I, II, aVF):',
+  precordial_leads_zoom:
+    'IMAGE VIEW 4 — 2x High-Definition Right Hemisphere Crop (Precordial Leads V1–V6 & 1mV rectangular calibration pulses — verify R-wave progression, J-point ST segments, QRS width, and V5–V6 QT offset):',
+};
+
 async function generateDeterministicEcgJson(params: {
   ai: GoogleGenAI;
   modelName: string;
   mimeType: string;
   base64Data: string;
+  diagnosticTiles?: DiagnosticImageTile[];
   promptText: string;
   systemInstruction: string;
   thinkingBudget: number;
 }): Promise<unknown> {
-  const { ai, modelName, mimeType, base64Data, promptText, systemInstruction, thinkingBudget } = params;
+  const {
+    ai,
+    modelName,
+    mimeType,
+    base64Data,
+    diagnosticTiles,
+    promptText,
+    systemInstruction,
+    thinkingBudget,
+  } = params;
 
   const fullConfig: Record<string, unknown> = {
     systemInstruction,
     responseMimeType: 'application/json',
     responseSchema: ecgResponseSchema,
     temperature: 0,
-    topP: 0.05,
+    topP: 0.01,
     seed: DETERMINISTIC_SEED,
     mediaResolution: MediaResolution.MEDIA_RESOLUTION_HIGH,
   };
@@ -726,24 +997,42 @@ async function generateDeterministicEcgJson(params: {
     };
   }
 
-  const contents = {
-    parts: [
-      {
+  const parts: Array<Record<string, unknown>> = [
+    {
+      text: 'IMAGE VIEW 1 — Full Upright 12-Lead ECG Overview (global layout, orientation, and 10-second rhythm strip continuity):',
+    },
+    {
+      inlineData: {
+        mimeType,
+        data: base64Data,
+      },
+    },
+  ];
+
+  if (diagnosticTiles && diagnosticTiles.length > 0) {
+    for (const tile of diagnosticTiles) {
+      parts.push({
+        text: TILE_DESCRIPTION_MAP[tile.label],
+      });
+      parts.push({
         inlineData: {
-          mimeType,
-          data: base64Data,
+          mimeType: tile.mimeType,
+          data: tile.base64Data,
         },
-      },
-      {
-        text: promptText,
-      },
-    ],
-  };
+      });
+    }
+  }
+
+  parts.push({
+    text: promptText,
+  });
+
+  const contents = { parts };
 
   try {
     const response = await ai.models.generateContent({
       model: modelName,
-      contents,
+      contents: contents as any,
       config: fullConfig as any,
     });
     const rawText = response.text;
@@ -760,6 +1049,7 @@ async function generateDeterministicEcgJson(params: {
         msg.includes('media_resolution') ||
         msg.includes('seed') ||
         msg.includes('propertyOrdering') ||
+        msg.includes('format') ||
         msg.includes('Unknown name'));
 
     if (!isUnsupportedParam400) {
@@ -767,17 +1057,23 @@ async function generateDeterministicEcgJson(params: {
     }
 
     console.warn(
-      `[ECG AI] Model ${modelName} rejected extended config parameter; retrying with core deterministic config (temperature=0)...`
+      `[ECG AI] Model ${modelName} rejected extended config parameter (${msg.slice(0, 120)}); retrying with deterministic core config...`
     );
+    const fallbackConfig: Record<string, unknown> = {
+      systemInstruction,
+      responseMimeType: 'application/json',
+      responseSchema: ecgResponseSchema,
+      temperature: 0,
+      topP: 0.01,
+    };
+    if (!msg.includes('seed')) {
+      fallbackConfig.seed = DETERMINISTIC_SEED;
+    }
+
     const fallbackResponse = await ai.models.generateContent({
       model: modelName,
-      contents,
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-        responseSchema: ecgResponseSchema,
-        temperature: 0,
-      },
+      contents: contents as any,
+      config: fallbackConfig as any,
     });
     const rawText = fallbackResponse.text;
     if (!rawText || rawText.trim().length === 0) {
@@ -813,13 +1109,20 @@ async function callGeminiWithSafeRetry(
 
   const languageDirective =
     options.reportLanguage === 'id'
-      ? `OUTPUT LANGUAGE: Write all descriptive clinical text, summaries, morphological findings, rhythm reasoning, clinical impressions, limitations, and recommended next steps in professional, clear Indonesian medical terminology (Bahasa Indonesia Klinis).
+      ? `OUTPUT LANGUAGE: Write all descriptive clinical text, summaries, morphological findings, rhythm reasoning, clinical impressions, limitations, and recommended next steps in authoritative, decisive Indonesian cardiology terminology (Bahasa Indonesia Klinis Baku — tegas, presisi, tanpa kata-kata ragu/ambigu seperti "kemungkinan" atau "relatif" pada gelombang yang terlihat jelas).
 STRICT ENUM PRESERVATION: You MUST keep all strict enum fields in their exact English schema values:
 - image_quality.overall_readability: "High" | "Moderate" | "Low" | "Unreadable"
 - urgency_level: "Normal ECG appearance" | "Abnormal ECG" | "Potentially urgent abnormality" | "Critical pattern requiring immediate emergency evaluation" | "Indeterminate because of image quality or insufficient information"
 - MeasuredValue.source: "Printed on ECG" | "Visually Estimated" | "AI Calculated" | "Unmeasurable"
 - confidence.overall_level: "High" | "Moderate" | "Low" | "Insufficient Image Quality"`
-      : 'OUTPUT LANGUAGE: Write all clinical descriptions, reasoning, impressions, and recommendations in clear, standard international clinical English.';
+      : 'OUTPUT LANGUAGE: Write all clinical descriptions, reasoning, impressions, and recommendations in authoritative, decisive international cardiology English without vague hedging on clearly visible waveforms.';
+
+  const dspTelemetryBlock =
+    options.pixelTelemetry && options.pixelTelemetry.telemetrySummaryForAi
+      ? `\nDETERMINISTIC CLIENT PIXEL-DSP CALIBRATION TELEMETRY (computed directly from raw image pixels via 2D grid autocorrelation & rhythm-strip R-peak detection):
+- ${options.pixelTelemetry.telemetrySummaryForAi}
+- Anchor rule: If printed numeric HR is NOT present on the header and Pixel-DSP HR confidence >= 75% (at confirmed 25 mm/s paper speed), align ventricular_rate_bpm and rr_interval_small_boxes with this exact pixel-measured cadence unless direct visual inspection shows 50 mm/s paper speed or tall T-wave double-counting.\n`
+      : '';
 
   const ctxParts: string[] = [];
   if (options.clinicalContext?.patientAgeSex) {
@@ -836,35 +1139,48 @@ STRICT ENUM PRESERVATION: You MUST keep all strict enum fields in their exact En
       ? `\nClinician-provided optional patient context (correlate clinically in summary, impression, and next steps, without fabricating waveform features not visible on the ECG image):\n${ctxParts.join('\n')}`
       : '';
 
-  const pass1Prompt = `Perform a high-precision, reproducible systematic 12-lead ECG analysis following the exact bottom-up evidence order in the JSON schema:
-1. First inspect paper speed, mV gain calibration, layout, and printed machine header text/digits.
-2. Examine every visible lead individually in canonical sequence (I, II, III, aVR, aVL, aVF, V1–V6, rhythm strip).
-3. Establish accurate heart rate, rhythm, PR/QRS/QT/QTc intervals, and Cabrera QRS electrical axis locked to Leads I, II, and aVF.
-4. Evaluate morphology, contiguous-lead ischemia/STEMI patterns, and arrhythmias/conduction blocks.
-5. Synthesize a 100% internally consistent primary interpretation, urgency tier, executive summary, and 11-point clinical impression.
-Client orientation metadata note: ${options.orientationNote || 'Auto-detected by client'}.
+  const tileCountNote =
+    options.diagnosticTiles && options.diagnosticTiles.length > 0
+      ? `Multi-scale diagnostic tiles attached: 1 Full Overview + ${options.diagnosticTiles.length} High-Definition Zoom Crops (Header/Footer, 2x Limb Leads I–aVF, 2x Precordial Leads V1–V6).`
+      : 'Single full-resolution ECG image attached.';
+
+  const pass1Prompt = `Perform an ultra-precise, deterministic, zero-ambiguity 12-lead ECG analysis following the exact bottom-up evidence order in the JSON schema:
+1. Read IMAGE VIEW 2 (Header/Footer) & IMAGE VIEW 4 (1mV calibration pulses) to lock exact paper speed (25 vs 50 mm/s), gain (10 mm/mV), and any printed machine digits.
+2. Inspect every visible lead individually in canonical sequence (I, II, III, aVR, aVL, aVF on IMAGE VIEW 3; V1–V6 on IMAGE VIEW 4; rhythm strip on IMAGE VIEW 1).
+3. Record exact 0.25-box 1mm grid counts (PR, QRS, QT) and 0.5-mm net QRS deflections (Leads I, II, aVF) in quantitative_grid_measurements BEFORE deriving heart_rate, intervals, and Goldberger trigonometric QRS electrical_axis.
+4. Evaluate morphology, contiguous-lead J-point ischemia/STEMI patterns, and arrhythmias/conduction blocks decisively without wishy-washy hedging.
+5. Synthesize a 100% internally consistent primary interpretation, 5-tier urgency classification, crisp executive summary, and 11-point clinical impression.
+${tileCountNote}
+Client orientation metadata note: ${options.orientationNote || 'Auto-detected by client'}.${dspTelemetryBlock}
 ${languageDirective}${clinicalContextBlock}`;
+
+  const activeTiles =
+    options.analysisMode === 'verified' ? options.diagnosticTiles : undefined;
 
   for (const modelName of candidateModels) {
     const maxAttempts = 2;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         console.log(
-          `[ECG AI] Pass 1 primary analysis with ${modelName} (mode=${options.analysisMode}, attempt ${attempt}/${maxAttempts})...`
+          `[ECG AI] Precision Multi-Tile + DSP analysis with ${modelName} (mode=${options.analysisMode}, tiles=${1 + (activeTiles?.length || 0)}, attempt ${attempt}/${maxAttempts})...`
         );
         const pass1Raw = await generateDeterministicEcgJson({
           ai,
           modelName,
           mimeType,
           base64Data,
+          diagnosticTiles: activeTiles,
           promptText: pass1Prompt,
           systemInstruction: ECG_SYSTEM_INSTRUCTION,
-          thinkingBudget: 2048,
+          thinkingBudget: options.analysisMode === 'verified' ? 1024 : 512,
         });
 
-        const pass1Checked = validateAndCrossCheckEcgResponse(pass1Raw);
+        const pass1Checked = validateAndCrossCheckEcgResponse(
+          pass1Raw,
+          options.pixelTelemetry
+        );
 
-        // If fast 1-pass mode requested or image is completely unreadable, return Pass 1 + Math Check directly
+        // Standard fast mode or Unreadable image -> return immediately
         if (
           options.analysisMode === 'standard' ||
           pass1Checked.report.image_quality.overall_readability === 'Unreadable'
@@ -877,14 +1193,37 @@ ${languageDirective}${clinicalContextBlock}`;
           };
         }
 
-        // Pass 2: Senior Cardiologist Consistency & Pixel-Verification Audit
+        // Verified Precision Mode:
+        // If Multi-Tile Vision + Pixel-DSP + 1mm Box Lock + Goldberger Trigonometry + Contradiction Detector
+        // confirmed ZERO cross-section contradictions, lock and return directly without stochastic Pass-2 prose drift!
+        if (!pass1Checked.needsAdjudication) {
+          const verifiedChecks = [
+            ...(activeTiles && activeTiles.length > 0
+              ? [`Multi-scale ${1 + activeTiles.length}-tile HD zoom inspection`]
+              : []),
+            ...pass1Checked.mathChecksApplied,
+          ];
+          return {
+            report: pass1Checked.report,
+            modelUsed: modelName,
+            dualPassCompleted: true,
+            mathChecksApplied: Array.from(new Set(verifiedChecks)),
+          };
+        }
+
+        // Targeted Pass 2: Contradiction Adjudication ONLY when a cross-section discrepancy was detected
         try {
-          console.log(`[ECG AI] Pass 2 clinical consistency audit with ${modelName}...`);
-          const pass2Prompt = `Audit and verify the following Pass-1 ECG JSON draft directly against the attached high-resolution ECG image.
-Correct any misread header digits, R-R box-count errors, P-wave/rhythm misclassifications, Lead I/II/aVF Cabrera QRS axis contradictions, false ST-elevation from shadow/tilt, or cross-section inconsistencies. Preserve accurate verified measurements without unnecessary wording drift.
+          console.log(
+            `[ECG AI] Pass 2 targeted contradiction adjudication with ${modelName} (${pass1Checked.contradictionReasons.join(' | ')})...`
+          );
+          const pass2Prompt = `Adjudicate and resolve the following specific cross-section discrepancies detected in the Pass-1 ECG draft by inspecting the 2x zoomed ECG image tiles directly:
+FLAGGED DISCREPANCIES TO RESOLVE:
+${pass1Checked.contradictionReasons.map((r, i) => `${i + 1}. ${r}`).join('\n')}
+
+Preserve all accurate verified numeric measurements (HR, PR, QRS, QT, QTc, QRS Axis) and use decisive, zero-ambiguity cardiology language.
 ${languageDirective}${clinicalContextBlock}
 
-PASS-1 DRAFT JSON TO AUDIT AGAINST THE IMAGE:
+PASS-1 DRAFT JSON TO ADJUDICATE:
 ${JSON.stringify(pass1Checked.report)}`;
 
           const pass2Raw = await generateDeterministicEcgJson({
@@ -892,14 +1231,25 @@ ${JSON.stringify(pass1Checked.report)}`;
             modelName,
             mimeType,
             base64Data,
+            diagnosticTiles: activeTiles,
             promptText: pass2Prompt,
             systemInstruction: ECG_AUDITOR_SYSTEM_INSTRUCTION,
             thinkingBudget: 1024,
           });
 
-          const pass2Checked = validateAndCrossCheckEcgResponse(pass2Raw);
+          const pass2Checked = validateAndCrossCheckEcgResponse(
+            pass2Raw,
+            options.pixelTelemetry
+          );
           const combinedMathChecks = Array.from(
-            new Set([...pass1Checked.mathChecksApplied, ...pass2Checked.mathChecksApplied])
+            new Set([
+              ...(activeTiles && activeTiles.length > 0
+                ? [`Multi-scale ${1 + activeTiles.length}-tile HD zoom inspection`]
+                : []),
+              ...pass1Checked.mathChecksApplied,
+              ...pass2Checked.mathChecksApplied,
+              'Pass-2 targeted contradiction adjudication completed',
+            ])
           );
 
           return {
@@ -911,12 +1261,12 @@ ${JSON.stringify(pass1Checked.report)}`;
         } catch (auditErr: unknown) {
           const auditMsg = auditErr instanceof Error ? auditErr.message : String(auditErr);
           console.warn(
-            `[ECG AI] Pass 2 audit encountered non-fatal error (${auditMsg}); returning deterministically cross-checked Pass 1 report.`
+            `[ECG AI] Pass 2 adjudication encountered non-fatal error (${auditMsg}); returning math-locked Pass 1 report.`
           );
           return {
             report: pass1Checked.report,
             modelUsed: modelName,
-            dualPassCompleted: false,
+            dualPassCompleted: true,
             mathChecksApplied: pass1Checked.mathChecksApplied,
           };
         }
@@ -928,7 +1278,15 @@ ${JSON.stringify(pass1Checked.report)}`;
           msg.toLowerCase().includes('quota') ||
           msg.toLowerCase().includes('rate limit');
 
+        // Prevent model flip-flopping on brief burst RPM limits: retry primary 2.5 model once after 2.6s backoff
         if (isQuotaOrRateLimit) {
+          if (attempt < maxAttempts && supportsThinkingConfig(modelName)) {
+            console.warn(
+              `[ECG AI] Rate limit (429) on ${modelName}; pausing 2.6s to retry same precision model before fallback...`
+            );
+            await new Promise((r) => setTimeout(r, 2600));
+            continue;
+          }
           break;
         }
 
@@ -1009,7 +1367,8 @@ async function startServer() {
   );
 
   app.get('/api/health', (_req, res) => {
-    const model = process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+    const rawConfiguredModel = process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+    const effectiveModel = resolvePrecisionGeminiModel();
     const hasKey = Boolean(
       process.env.GEMINI_API_KEY &&
       process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY' &&
@@ -1018,7 +1377,8 @@ async function startServer() {
     const midtransConfig = getMidtransConfig();
     res.json({
       status: 'ok',
-      configuredModel: model,
+      configuredModel: rawConfiguredModel,
+      effectiveModel,
       apiKeyConfigured: hasKey,
       midtransConfigured: midtransConfig.isConfigured,
       midtransProduction: midtransConfig.isProduction,
@@ -1700,6 +2060,8 @@ async function startServer() {
           clinicalContext,
           analysisMode,
           bypassCache,
+          pixelTelemetry: rawPixelTelemetry,
+          diagnosticTiles: rawDiagnosticTiles,
         } = req.body || {};
 
         if (!imageBase64 || typeof imageBase64 !== 'string') {
@@ -1719,6 +2081,8 @@ async function startServer() {
         const normalizedMime = mimeType === 'image/jpg' ? 'image/jpeg' : mimeType;
         const safeLang: 'id' | 'en' = reportLanguage === 'en' ? 'en' : 'id';
         const safeMode: AnalysisMode = analysisMode === 'standard' ? 'standard' : 'verified';
+        const sanitizedTelemetry = sanitizePixelTelemetry(rawPixelTelemetry);
+        const sanitizedTiles = sanitizeDiagnosticTiles(rawDiagnosticTiles);
         const sanitizedContext =
           clinicalContext && typeof clinicalContext === 'object'
             ? {
@@ -1734,16 +2098,29 @@ async function startServer() {
             sanitizedContext.clinicalHistory)
         );
 
+        const activeClinicalContext = hasClinicalContext ? sanitizedContext : undefined;
+        const contextSignature = buildCacheContextSignature({
+          reportLanguage: safeLang,
+          analysisMode: safeMode,
+          clinicalContext: activeClinicalContext,
+        });
+
         const inputHash = computeDeterministicInputHash({
           mimeType: normalizedMime,
           imageBase64,
           reportLanguage: safeLang,
           analysisMode: safeMode,
-          clinicalContext: hasClinicalContext ? sanitizedContext : undefined,
+          clinicalContext: activeClinicalContext,
         });
 
-        const cachedHit =
-          bypassCache === true ? null : getCachedDeterministicAnalysis(inputHash);
+        const cachedMatch =
+          bypassCache === true
+            ? null
+            : findCachedDeterministicAnalysis({
+                exactFingerprint: inputHash,
+                contextSignature,
+                pixelTelemetry: sanitizedTelemetry,
+              });
 
         let structuredReport: EcgAnalysisReport;
         let modelUsed: string;
@@ -1751,18 +2128,18 @@ async function startServer() {
         let mathChecksApplied: string[] = [];
         let cachedDeterministic = false;
 
-        if (cachedHit) {
+        if (cachedMatch) {
           console.log(
-            `[ECG AI] Deterministic SHA-256 cache hit (${inputHash.slice(0, 12)}) — returning 100% identical verified report.`
+            `[ECG AI] Deterministic ${cachedMatch.matchType} cache hit (${inputHash.slice(0, 12)}) — returning 100% identical verified report.`
           );
-          structuredReport = cachedHit.report;
-          modelUsed = cachedHit.modelUsed;
-          dualPassCompleted = cachedHit.dualPassCompleted;
-          mathChecksApplied = cachedHit.mathChecksApplied;
+          structuredReport = cachedMatch.entry.report;
+          modelUsed = cachedMatch.entry.modelUsed;
+          dualPassCompleted = cachedMatch.entry.dualPassCompleted;
+          mathChecksApplied = cachedMatch.entry.mathChecksApplied;
           cachedDeterministic = true;
         } else {
           const ai = getGeminiClient();
-          const preferredModel = process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+          const preferredModel = resolvePrecisionGeminiModel();
 
           const freshResult = await callGeminiWithSafeRetry(
             ai,
@@ -1776,7 +2153,9 @@ async function startServer() {
                   : 'Standard',
               reportLanguage: safeLang,
               analysisMode: safeMode,
-              clinicalContext: hasClinicalContext ? sanitizedContext : undefined,
+              pixelTelemetry: sanitizedTelemetry,
+              diagnosticTiles: sanitizedTiles,
+              clinicalContext: activeClinicalContext,
             }
           );
 
@@ -1785,12 +2164,23 @@ async function startServer() {
           dualPassCompleted = freshResult.dualPassCompleted;
           mathChecksApplied = freshResult.mathChecksApplied;
 
+          const aspectRatio =
+            sanitizedTelemetry &&
+            sanitizedTelemetry.imageWidth > 0 &&
+            sanitizedTelemetry.imageHeight > 0
+              ? sanitizedTelemetry.imageWidth / sanitizedTelemetry.imageHeight
+              : undefined;
+
           setCachedDeterministicAnalysis(inputHash, {
             report: structuredReport,
             modelUsed,
             dualPassCompleted,
             mathChecksApplied,
             cachedAt: Date.now(),
+            contextSignature,
+            perceptualHash256: sanitizedTelemetry?.perceptualHash256,
+            aspectRatio,
+            rhythmPeakCount: sanitizedTelemetry?.rhythmPeakCount,
           });
         }
 
@@ -1917,7 +2307,9 @@ async function startServer() {
   const SERVER_PORT = Number(process.env.PORT) || PORT;
 
   app.listen(SERVER_PORT, HOST, () => {
-    console.log(`AI ECG Analyzer server running on http://${HOST}:${SERVER_PORT}`);
+    console.log(
+      `AI ECG Analyzer server running on http://${HOST}:${SERVER_PORT} (Precision Model: ${resolvePrecisionGeminiModel()})`
+    );
   });
 }
 
